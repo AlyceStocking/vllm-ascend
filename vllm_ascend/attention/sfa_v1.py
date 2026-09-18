@@ -156,6 +156,14 @@ def sparse_mla(query, cache, indices, metadata, scale):
             return_softmax_lse=False,
         )
     output = result[0]
+    # Only elide the mask in eager execution with no padding. A captured graph
+    # can replay with fewer real tokens at the same capacity, so the capture's
+    # host-side token count must not remove its device-side padding guard.
+    if (
+        get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
+        and query.shape[0] == metadata.num_actual_tokens
+    ):
+        return output
     # Kernels may leave graph-capacity rows unwritten. Mask on device before
     # value/output projections so NaNs in padding cannot escape the layer.
     valid = torch.arange(query.shape[0], device=query.device) < metadata.query_start_loc[-1]
