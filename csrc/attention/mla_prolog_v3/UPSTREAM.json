@@ -1,0 +1,514 @@
+{
+  "repository": "https://gitcode.com/cann/ops-transformer",
+  "pull_request": 14225,
+  "source_repository": "https://gitcode.com/yolic/transformer-readme",
+  "source_commit": "b581a9734e30ed43a08dc5f316ce3adbd49d0560",
+  "base_commit": "4b92adc974cade0ae510e3b6265320e5f6fbc380",
+  "files": [
+    {
+      "path": "csrc/attention/mla_prolog/LICENSE",
+      "source_path": "LICENSE",
+      "source_sha256": "89b1c114df62cfd183004f38d18d07f186436c3b37203dd69c3e84becf9d2282",
+      "sha256": "89b1c114df62cfd183004f38d18d07f186436c3b37203dd69c3e84becf9d2282",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_host/mla_prolog_infershape.h",
+      "source_path": "attention/mla_prolog/op_host/mla_prolog_infershape.h",
+      "source_sha256": "a9cee017979fa56f70e31540333f1c03f813c5a084fd340b4b06b6f992b0ec64",
+      "sha256": "a9cee017979fa56f70e31540333f1c03f813c5a084fd340b4b06b6f992b0ec64",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_host/mla_prolog_kn_search.h",
+      "source_path": "attention/mla_prolog/op_host/mla_prolog_kn_search.h",
+      "source_sha256": "002888a1469c7ae925c122d9f09f38465ad4cc7a8d2db6ab43b3cac09132c52f",
+      "sha256": "002888a1469c7ae925c122d9f09f38465ad4cc7a8d2db6ab43b3cac09132c52f",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_host/mla_prolog_tiling.cpp",
+      "source_path": "attention/mla_prolog/op_host/mla_prolog_tiling.cpp",
+      "source_sha256": "c2612c3bdba69aa0540317fc1e08e16a50ba2d0c320b239b317c1c5d964c7c77",
+      "sha256": "c2612c3bdba69aa0540317fc1e08e16a50ba2d0c320b239b317c1c5d964c7c77",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_host/mla_prolog_tiling.h",
+      "source_path": "attention/mla_prolog/op_host/mla_prolog_tiling.h",
+      "source_sha256": "59167ef80b042d65d3caffd026da94050cee37769812a56fbb9bf5be75da1326",
+      "sha256": "59167ef80b042d65d3caffd026da94050cee37769812a56fbb9bf5be75da1326",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_host/mla_prolog_tiling_check.cpp",
+      "source_path": "attention/mla_prolog/op_host/mla_prolog_tiling_check.cpp",
+      "source_sha256": "4b06f1af07473c5121dbfcaa83330f8b4437425ea66e5a89624347d74c4cc286",
+      "sha256": "4b06f1af07473c5121dbfcaa83330f8b4437425ea66e5a89624347d74c4cc286",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_host/mla_prolog_tiling_check.h",
+      "source_path": "attention/mla_prolog/op_host/mla_prolog_tiling_check.h",
+      "source_sha256": "6b30894e07bfa51210d1d8b4e1104265c9ad6ffe7875f65cb59379c2a5386847",
+      "sha256": "6212ca22703d98884053b5d3b1d808b48ef04e225ef19fcd60f6e357c4cf1369",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_host/mla_prolog_ub_budget.h",
+      "source_path": "attention/mla_prolog/op_host/mla_prolog_ub_budget.h",
+      "source_sha256": "7ad2f95d523dfae31c3771ee142665c8317d1d2545002f6aa574a0a8832873e3",
+      "sha256": "7ad2f95d523dfae31c3771ee142665c8317d1d2545002f6aa574a0a8832873e3",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch22/kernel_mla_prolog_split_n_arch22.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch22/kernel_mla_prolog_split_n_arch22.h",
+      "source_sha256": "07750f2b7ab0650f4ea886f5c77416a3d8860929900e3d1b280ca3102ff33a14",
+      "sha256": "07750f2b7ab0650f4ea886f5c77416a3d8860929900e3d1b280ca3102ff33a14",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch22/mla_prolog_comm_arch22.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch22/mla_prolog_comm_arch22.h",
+      "source_sha256": "e977456ed248a643161d6e7f740909f6d02ec10c819cdb3111b7f2ad0d88d86b",
+      "sha256": "e977456ed248a643161d6e7f740909f6d02ec10c819cdb3111b7f2ad0d88d86b",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch22/mla_prolog_vector_comm_arch22.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch22/mla_prolog_vector_comm_arch22.h",
+      "source_sha256": "73e17afa4f5b646c1e52eee8af489a8a180e2346ca62dde191e3cdd297b275a7",
+      "sha256": "73e17afa4f5b646c1e52eee8af489a8a180e2346ca62dde191e3cdd297b275a7",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch22/rms_norm.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch22/rms_norm.h",
+      "source_sha256": "b10727462d8062ddac6c78510a326ce9e93a861fbe3c616485fdd22feba0bc08",
+      "sha256": "b10727462d8062ddac6c78510a326ce9e93a861fbe3c616485fdd22feba0bc08",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch22/service_dequant_arch22.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch22/service_dequant_arch22.h",
+      "source_sha256": "2b0d6968bb386882de9c1cba234e9ed08a3af304843f6434a602d3d4bf707842",
+      "sha256": "2b0d6968bb386882de9c1cba234e9ed08a3af304843f6434a602d3d4bf707842",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch22/service_dynamic_quant_qn_mul_qr_arch22.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch22/service_dynamic_quant_qn_mul_qr_arch22.h",
+      "source_sha256": "49f25e80eaa3052cbf87bfd0a3cf525d3b6ae1e397cea53191c43a49fd6d549c",
+      "sha256": "49f25e80eaa3052cbf87bfd0a3cf525d3b6ae1e397cea53191c43a49fd6d549c",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch22/service_gather_sin_cos_arch22.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch22/service_gather_sin_cos_arch22.h",
+      "source_sha256": "5eb087353157c486ac86fc039e993efe99882778ba1d145ca31229bd0e413691",
+      "sha256": "5eb087353157c486ac86fc039e993efe99882778ba1d145ca31229bd0e413691",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch22/service_matmul_arch22.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch22/service_matmul_arch22.h",
+      "source_sha256": "ea0e6a3488d5a0297375793d8b21bdd41d60d5f6798265ab665e46b835351d68",
+      "sha256": "ea0e6a3488d5a0297375793d8b21bdd41d60d5f6798265ab665e46b835351d68",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch22/service_rms_norm_arch22.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch22/service_rms_norm_arch22.h",
+      "source_sha256": "e01ee9747c3224f7b9d6d49fe412c64efb0a250cbdd5e4cc4df1a985ea7d5a38",
+      "sha256": "e01ee9747c3224f7b9d6d49fe412c64efb0a250cbdd5e4cc4df1a985ea7d5a38",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch22/service_rope_arch22.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch22/service_rope_arch22.h",
+      "source_sha256": "83ecac3419098c4ec99dc6a78db204dde69e95acc310a34f7d41ffd33b4bc318",
+      "sha256": "83ecac3419098c4ec99dc6a78db204dde69e95acc310a34f7d41ffd33b4bc318",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch22/service_rotary_position_embedding_arch22.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch22/service_rotary_position_embedding_arch22.h",
+      "source_sha256": "6f86884143acdd17f7d51800bb378d7ac31e699fb1f3ee0fd3ae45e3247df842",
+      "sha256": "6f86884143acdd17f7d51800bb378d7ac31e699fb1f3ee0fd3ae45e3247df842",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch22/service_scatter_cache_arch22.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch22/service_scatter_cache_arch22.h",
+      "source_sha256": "3d3e59ec7177c6381c75e9f9b025c9a5401dcdb14d52b35a1f6c16d2165ee547",
+      "sha256": "3d3e59ec7177c6381c75e9f9b025c9a5401dcdb14d52b35a1f6c16d2165ee547",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/kernel_mla_prolog_split_m.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/kernel_mla_prolog_split_m.h",
+      "source_sha256": "e4a0688375492cfcd23ff528b10381d3a34223539497cec28814322d3d38bee4",
+      "sha256": "e4a0688375492cfcd23ff528b10381d3a34223539497cec28814322d3d38bee4",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/kernel_mla_prolog_split_n_arch35.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/kernel_mla_prolog_split_n_arch35.h",
+      "source_sha256": "81d9ca8290a0f65d05bd0c83df45c2581c30cc9007337b0588618603175c9d0e",
+      "sha256": "81d9ca8290a0f65d05bd0c83df45c2581c30cc9007337b0588618603175c9d0e",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/mla_prolog_comm_arch35.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/mla_prolog_comm_arch35.h",
+      "source_sha256": "7efde023de09dd6186536b2cc45c76091f3fbed3c211c9f8965690efba453e80",
+      "sha256": "7efde023de09dd6186536b2cc45c76091f3fbed3c211c9f8965690efba453e80",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/mla_prolog_vector_comm_arch35.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/mla_prolog_vector_comm_arch35.h",
+      "source_sha256": "f6d7e064389ca01a22ece3f347cd08bb9d91cd8ed6f3d1302a35af79f75fe4f5",
+      "sha256": "f6d7e064389ca01a22ece3f347cd08bb9d91cd8ed6f3d1302a35af79f75fe4f5",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/service_dequant_arch35.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/service_dequant_arch35.h",
+      "source_sha256": "0770894f295b7c883827d155d52e4a9fbedbbba98269c9aeda65847a986065d7",
+      "sha256": "0770894f295b7c883827d155d52e4a9fbedbbba98269c9aeda65847a986065d7",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/service_dynamic_quant_qn_mul_qr_arch35.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/service_dynamic_quant_qn_mul_qr_arch35.h",
+      "source_sha256": "714b1598096720707625ca9e9959dbf28670627037e5d12008374b661b9e0775",
+      "sha256": "714b1598096720707625ca9e9959dbf28670627037e5d12008374b661b9e0775",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/service_gather_sin_cos_arch35.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/service_gather_sin_cos_arch35.h",
+      "source_sha256": "09537139ea071a3fdc4673d30bff7589e71dc828aecf006ea504bf29a755c606",
+      "sha256": "09537139ea071a3fdc4673d30bff7589e71dc828aecf006ea504bf29a755c606",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/service_matmul_arch35.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/service_matmul_arch35.h",
+      "source_sha256": "9fb5f6d4057eead70c044a78b3b047825c54c2d54bf973314dd9b3ec3e0441ad",
+      "sha256": "9fb5f6d4057eead70c044a78b3b047825c54c2d54bf973314dd9b3ec3e0441ad",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/service_rms_norm_arch35.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/service_rms_norm_arch35.h",
+      "source_sha256": "bbe15609250f4afe15e196de13e86f8ab0c143ceab9601c9d8e0f23eaa0634c3",
+      "sha256": "bbe15609250f4afe15e196de13e86f8ab0c143ceab9601c9d8e0f23eaa0634c3",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/service_rope_arch35.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/service_rope_arch35.h",
+      "source_sha256": "f9658ff44a3a9b54740e38c651bc1224da82ddbb767f404eb4a28135c466baa4",
+      "sha256": "f9658ff44a3a9b54740e38c651bc1224da82ddbb767f404eb4a28135c466baa4",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/service_rotary_position_embedding_arch35.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/service_rotary_position_embedding_arch35.h",
+      "source_sha256": "378434dc7ab4fadbd7e82ca05141adbd74d90a5cf70fb86b11506bed429ec78f",
+      "sha256": "378434dc7ab4fadbd7e82ca05141adbd74d90a5cf70fb86b11506bed429ec78f",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/service_scatter_cache_arch35.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/service_scatter_cache_arch35.h",
+      "source_sha256": "7af6c34c0a13fcce2d29d8e5637035095561c7fbcfa78d1393eca4afbc890dee",
+      "sha256": "7af6c34c0a13fcce2d29d8e5637035095561c7fbcfa78d1393eca4afbc890dee",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/vf/vf_comm.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/vf/vf_comm.h",
+      "source_sha256": "0b4fecc03fbbec20ea03320762cbb1d6f72eee2b6777da78b0191e2d9c6e70f0",
+      "sha256": "96cbb7409d453fbac76bcaa73073935bd44f18b9b86f5ab11030f3265631123e",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/vf/vf_dequant.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/vf/vf_dequant.h",
+      "source_sha256": "8b8d09a4a60df098ec36a5d43297804f70110ae064f8b4a79d4c968a11f455e3",
+      "sha256": "5dfb25d26e6d5bc16e68950920709d9aa58208b13b4cfbaf4b4e2b67cda462d8",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/vf/vf_dynamic_quant.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/vf/vf_dynamic_quant.h",
+      "source_sha256": "79ab45f89b005f849153b2d51dc00c5def2c5a363fdf7cdc33c6a1000515fc4d",
+      "sha256": "79ab45f89b005f849153b2d51dc00c5def2c5a363fdf7cdc33c6a1000515fc4d",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/vf/vf_mul_qr.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/vf/vf_mul_qr.h",
+      "source_sha256": "ea220359350d237289441b9e93c31ec6a2c091ef4d67d55178d4cc10fa098f05",
+      "sha256": "ea220359350d237289441b9e93c31ec6a2c091ef4d67d55178d4cc10fa098f05",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/vf/vf_quant_perchannel.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/vf/vf_quant_perchannel.h",
+      "source_sha256": "55f0065128cd9771c4c6c32e34748107a79473713f4f1b939a2e0720b82622ee",
+      "sha256": "69cf4d3eefa0d9d96dcb9d89c9e3356edfba0e61af2a33a5d1ac010631619f7f",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/vf/vf_quant_pertensor.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/vf/vf_quant_pertensor.h",
+      "source_sha256": "c891a5821b846a5cd96bb79a305ae95ea69cf4bb4d0379e3d6fb2a472851eaec",
+      "sha256": "c891a5821b846a5cd96bb79a305ae95ea69cf4bb4d0379e3d6fb2a472851eaec",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/vf/vf_rms_norm.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/vf/vf_rms_norm.h",
+      "source_sha256": "72119c614d8d59228af7b729ddf957fd87b5cda779916a1d5e23c692ad930f4e",
+      "sha256": "72119c614d8d59228af7b729ddf957fd87b5cda779916a1d5e23c692ad930f4e",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch35/vf/vf_rope.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch35/vf/vf_rope.h",
+      "source_sha256": "cd8de33ced161a04a9465309b4f7fe69dfd2ec66d7b2e4844b0bb46e637527f2",
+      "sha256": "cd8de33ced161a04a9465309b4f7fe69dfd2ec66d7b2e4844b0bb46e637527f2",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/kernel_mla_prolog_split_m_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/kernel_mla_prolog_split_m_arch92.h",
+      "source_sha256": "83b7fd736df2dfa199046849153669b416a81d4b1bf4bf783c9f1b75b015b7e6",
+      "sha256": "83b7fd736df2dfa199046849153669b416a81d4b1bf4bf783c9f1b75b015b7e6",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/kernel_mla_prolog_split_n_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/kernel_mla_prolog_split_n_arch92.h",
+      "source_sha256": "0e8e5222012ee3b116cc2464bf6d2804ad6273ead6bd498fdeb536bdd17f858e",
+      "sha256": "0e8e5222012ee3b116cc2464bf6d2804ad6273ead6bd498fdeb536bdd17f858e",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/mla_prolog_comm_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/mla_prolog_comm_arch92.h",
+      "source_sha256": "dbefa0ec12be0bada9f500bf7f1d0906b44028c6c7377c723c87c3a808f7b6d6",
+      "sha256": "dbefa0ec12be0bada9f500bf7f1d0906b44028c6c7377c723c87c3a808f7b6d6",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/mla_prolog_vector_comm_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/mla_prolog_vector_comm_arch92.h",
+      "source_sha256": "ed84b514b27ea31b891befa0f404385b6d9c932bae34459b7d83094efb160297",
+      "sha256": "ed84b514b27ea31b891befa0f404385b6d9c932bae34459b7d83094efb160297",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/service_dequant_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/service_dequant_arch92.h",
+      "source_sha256": "5ac42ca073de376f67dfde91b0ac1b901ff488cabc6873323306c79ab9773c86",
+      "sha256": "5ac42ca073de376f67dfde91b0ac1b901ff488cabc6873323306c79ab9773c86",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/service_dynamic_quant_qn_mul_qr_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/service_dynamic_quant_qn_mul_qr_arch92.h",
+      "source_sha256": "b3d1c4424cc398131c722f963ec43ad0368d070bd392852b04815769f965eee3",
+      "sha256": "b3d1c4424cc398131c722f963ec43ad0368d070bd392852b04815769f965eee3",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/service_gather_sin_cos_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/service_gather_sin_cos_arch92.h",
+      "source_sha256": "babba16fa3537df593ed71d6916f7473b0e63f69ac4afe00f3ca7542fb5ec396",
+      "sha256": "babba16fa3537df593ed71d6916f7473b0e63f69ac4afe00f3ca7542fb5ec396",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/service_matmul_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/service_matmul_arch92.h",
+      "source_sha256": "25cdeba97ec6964d36346fffb03848df12f59d55b0e99f29c5deca53718dd9fd",
+      "sha256": "25cdeba97ec6964d36346fffb03848df12f59d55b0e99f29c5deca53718dd9fd",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/service_rms_norm_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/service_rms_norm_arch92.h",
+      "source_sha256": "1120b692cf43749064e2f9c447afe9e9a50ae44a32bdb31d029e9df026c77baa",
+      "sha256": "1120b692cf43749064e2f9c447afe9e9a50ae44a32bdb31d029e9df026c77baa",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/service_rope_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/service_rope_arch92.h",
+      "source_sha256": "e194229df0ee4a46c26acbbae79cd53c6d821c0c9c47f29c4864fd095711f326",
+      "sha256": "e194229df0ee4a46c26acbbae79cd53c6d821c0c9c47f29c4864fd095711f326",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/service_rotary_position_embedding_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/service_rotary_position_embedding_arch92.h",
+      "source_sha256": "c8a9045671a1d7003ac77b3756efc5e805c00be10ae1ab7da3edb4107778fa39",
+      "sha256": "c8a9045671a1d7003ac77b3756efc5e805c00be10ae1ab7da3edb4107778fa39",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/service_scatter_cache_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/service_scatter_cache_arch92.h",
+      "source_sha256": "ef453413333967094aa40ca397c9907d79e4c4aa13faffd8d9932b0f9cc08cf6",
+      "sha256": "ef453413333967094aa40ca397c9907d79e4c4aa13faffd8d9932b0f9cc08cf6",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/vf/vf_comm_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/vf/vf_comm_arch92.h",
+      "source_sha256": "338ba30a2a03c349d02da047bc2bd36abb1565b7de5424d262e7bc9fa2a36f17",
+      "sha256": "338ba30a2a03c349d02da047bc2bd36abb1565b7de5424d262e7bc9fa2a36f17",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/vf/vf_dequant_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/vf/vf_dequant_arch92.h",
+      "source_sha256": "8f8ec2bc57c3715f3baecc42202bccf68a41a25a01c0acc6ccd688a08ce3f822",
+      "sha256": "8f8ec2bc57c3715f3baecc42202bccf68a41a25a01c0acc6ccd688a08ce3f822",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/vf/vf_dynamic_quant_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/vf/vf_dynamic_quant_arch92.h",
+      "source_sha256": "6ddfe12f241fb4302ebb7ebf524e81ceacfed9c97ab5b164d885ef83eec028f4",
+      "sha256": "6ddfe12f241fb4302ebb7ebf524e81ceacfed9c97ab5b164d885ef83eec028f4",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/vf/vf_mul_qr_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/vf/vf_mul_qr_arch92.h",
+      "source_sha256": "41e02d3afdd31e23cd0119fa790b88e8c4ed4165bcef2eb45e9a8bf82575a3c5",
+      "sha256": "41e02d3afdd31e23cd0119fa790b88e8c4ed4165bcef2eb45e9a8bf82575a3c5",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/vf/vf_quant_perchannel_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/vf/vf_quant_perchannel_arch92.h",
+      "source_sha256": "686561f8d021350603cfcc37833a3649f3f55f8ff6136a910ba9f3f760ccc46f",
+      "sha256": "686561f8d021350603cfcc37833a3649f3f55f8ff6136a910ba9f3f760ccc46f",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/vf/vf_quant_pertensor_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/vf/vf_quant_pertensor_arch92.h",
+      "source_sha256": "8876783c572209b6c52b807546b350a0dd4761b6c7efb7607138412332e8088c",
+      "sha256": "8876783c572209b6c52b807546b350a0dd4761b6c7efb7607138412332e8088c",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/vf/vf_rms_norm_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/vf/vf_rms_norm_arch92.h",
+      "source_sha256": "98bffbf2b8b466322bcbc50b05c778bd867cf5fccb594a5374b639f538fe7390",
+      "sha256": "98bffbf2b8b466322bcbc50b05c778bd867cf5fccb594a5374b639f538fe7390",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/arch92/vf/vf_rope_arch92.h",
+      "source_path": "attention/mla_prolog/op_kernel/arch92/vf/vf_rope_arch92.h",
+      "source_sha256": "d2c89ecbc97e6994959a8c7324a11f8c579f4455970e7895d287558bb679ef87",
+      "sha256": "d2c89ecbc97e6994959a8c7324a11f8c579f4455970e7895d287558bb679ef87",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/mla_prolog_template_tiling_key.h",
+      "source_path": "attention/mla_prolog/op_kernel/mla_prolog_template_tiling_key.h",
+      "source_sha256": "1743f02661fd53cc088836dc0efc22214724fab1ea1aaafae0f3f531c38df6ab",
+      "sha256": "1743f02661fd53cc088836dc0efc22214724fab1ea1aaafae0f3f531c38df6ab",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog/op_kernel/mla_prolog_tiling_data.h",
+      "source_path": "attention/mla_prolog/op_kernel/mla_prolog_tiling_data.h",
+      "source_sha256": "13ef25288c1407af60baaaed0a0aa227dc4c4d73f7712ec0194fb905084ca7b0",
+      "sha256": "13ef25288c1407af60baaaed0a0aa227dc4c4d73f7712ec0194fb905084ca7b0",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog_v3/LICENSE",
+      "source_path": "LICENSE",
+      "source_sha256": "89b1c114df62cfd183004f38d18d07f186436c3b37203dd69c3e84becf9d2282",
+      "sha256": "89b1c114df62cfd183004f38d18d07f186436c3b37203dd69c3e84becf9d2282",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog_v3/op_api/aclnn_mla_prolog_v3_weight_nz.cpp",
+      "source_path": "attention/mla_prolog_v3/op_api/aclnn_mla_prolog_v3_weight_nz.cpp",
+      "source_sha256": "0950916bb2813a68a0019b13fda325d929da6fc56616423307a3ff158c19def9",
+      "sha256": "0950916bb2813a68a0019b13fda325d929da6fc56616423307a3ff158c19def9",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog_v3/op_api/aclnn_mla_prolog_v3_weight_nz.h",
+      "source_path": "attention/mla_prolog_v3/op_api/aclnn_mla_prolog_v3_weight_nz.h",
+      "source_sha256": "e3b9ca3402927875c8b6dd44801dd1393fca019c1d135a3b512dfa4c563c302a",
+      "sha256": "e3b9ca3402927875c8b6dd44801dd1393fca019c1d135a3b512dfa4c563c302a",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog_v3/op_host/CMakeLists.txt",
+      "source_path": "attention/mla_prolog_v3/op_host/CMakeLists.txt",
+      "source_sha256": "253e53492050c7581dbe151c0533bea1788c1c447d90270b89d685ee0a225ae5",
+      "sha256": "18610a099667da025693126a8f4184a1b80cd6011d3e37620ed268dae9aefdce",
+      "integration_change": true
+    },
+    {
+      "path": "csrc/attention/mla_prolog_v3/op_host/mla_prolog_v3_def.cpp",
+      "source_path": "attention/mla_prolog_v3/op_host/mla_prolog_v3_def.cpp",
+      "source_sha256": "c194e70453cbbb1b52686a41644965978923f224ea74c2f1c08ad3338ee6688c",
+      "sha256": "c194e70453cbbb1b52686a41644965978923f224ea74c2f1c08ad3338ee6688c",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog_v3/op_host/mla_prolog_v3_infershape.cpp",
+      "source_path": "attention/mla_prolog_v3/op_host/mla_prolog_v3_infershape.cpp",
+      "source_sha256": "2cc1881f2cf09d731f90f72c084492765d4d443db7c4cc091b362a1ef9d0cb4e",
+      "sha256": "2cc1881f2cf09d731f90f72c084492765d4d443db7c4cc091b362a1ef9d0cb4e",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog_v3/op_host/mla_prolog_v3_infershape.h",
+      "source_path": "attention/mla_prolog_v3/op_host/mla_prolog_v3_infershape.h",
+      "source_sha256": "cc88af358b2f6f5caab235b5bc77ecbbccc944b3d0524cbdae6199a2765679e4",
+      "sha256": "cc88af358b2f6f5caab235b5bc77ecbbccc944b3d0524cbdae6199a2765679e4",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog_v3/op_host/mla_prolog_v3_tiling.h",
+      "source_path": "attention/mla_prolog_v3/op_host/mla_prolog_v3_tiling.h",
+      "source_sha256": "a47f4bee84d56098bbb760dcd3f0b6516c775caaaa1824b1d5d6db36543754f1",
+      "sha256": "a47f4bee84d56098bbb760dcd3f0b6516c775caaaa1824b1d5d6db36543754f1",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog_v3/op_host/mla_prolog_v3_tiling_register.cpp",
+      "source_path": "attention/mla_prolog_v3/op_host/mla_prolog_v3_tiling_register.cpp",
+      "source_sha256": "75b73968d2dbf03fe8be563a1b41479553339607e6b8aaf6c52094ee834543f8",
+      "sha256": "75b73968d2dbf03fe8be563a1b41479553339607e6b8aaf6c52094ee834543f8",
+      "integration_change": false
+    },
+    {
+      "path": "csrc/attention/mla_prolog_v3/op_kernel/mla_prolog_v3.cpp",
+      "source_path": "attention/mla_prolog_v3/op_kernel/mla_prolog_v3.cpp",
+      "source_sha256": "d3c82f11d11de218b21687efa80ab20e64a9038d06da8e42061b7ec02a66f0cb",
+      "sha256": "d3c82f11d11de218b21687efa80ab20e64a9038d06da8e42061b7ec02a66f0cb",
+      "integration_change": false
+    }
+  ],
+  "normalization": "LF line endings and trailing whitespace only"
+}
