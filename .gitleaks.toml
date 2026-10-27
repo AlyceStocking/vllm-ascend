@@ -57,7 +57,8 @@ paths = ["^vllm-empty/"]
 [[allowlists]]
 paths = [
     "^csrc/notify_dispatch/op_host/notify_dispatch_tiling.cpp",
-    "^csrc/attention/mla_prolog_v3/op_kernel/mla_prolog_template_tiling_key.h"
+    "^csrc/attention/mla_prolog_v3/op_kernel/mla_prolog_template_tiling_key.h",
+    "^csrc/attention/mla_prolog/op_kernel/mla_prolog_template_tiling_key.h$"
 ]
 rules = ["generic-api-key"]
 

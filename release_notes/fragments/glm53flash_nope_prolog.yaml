@@ -1,0 +1,7 @@
+# Replace with the vllm-ascend PR number when this branch is submitted for review.
+pr: 0
+entries:
+  - category: feature
+    text: Added an opt-in GLM-5.3-Flash NoPE Prolog V3 path for A2/A3 W8A8C8, with the PR14225 custom operator sources and KPool query dequantization. Hardware validation is pending.
+    model: GLM-5.3-Flash
+    hardware: [A2, A3]

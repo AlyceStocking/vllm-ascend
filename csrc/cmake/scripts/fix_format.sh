@@ -33,3 +33,7 @@ if find $1 -type f -name "GroupedMatmulSwigluQuant_*json" -print0 | grep -q .; t
     echo "Found GroupedMatmulSwigluQuant_*json files, performing sed operation..."
     find $1 -type f -name "GroupedMatmulSwigluQuant_*json" -print0 | xargs -0 sed -i 's/FormatAgnostic/FormatDefault/g'
 fi
+# MlaPrologV3 W8A8 weights use FRACTAL_NZ and must retain format metadata.
+if find "$1" -type f -name "MlaPrologV3_*json" -print0 | grep -q .; then
+    find "$1" -type f -name "MlaPrologV3_*json" -print0 | xargs -0 sed -i 's/FormatAgnostic/FormatDefault/g'
+fi

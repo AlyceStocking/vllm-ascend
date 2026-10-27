@@ -440,6 +440,7 @@ class AscendConfig:
             "ascend_log_path": "~/ascend/log/vllm_ascend",
             "enable_fused_mc2": 0,
             "enable_mlapo": true,
+            "enable_nope_prolog_v3": false,
             "mlapo_keep_prefill_weights": false,
             "msmonitor_use_daemon": false,
             "enable_transpose_kv_cache_by_block": true,
@@ -610,6 +611,9 @@ class AscendConfig:
     # ---- A-family (envs fallback): default = envs module value, before-validator injects ----
     enable_fused_mc2: int = 0
     enable_mlapo: bool = True
+    # Opt in to PR14225 NoPE Prolog on A2/A3 W8A8 with int8 KV cache.
+    # Requires rebuilding the bundled mla_prolog_v3 custom operator.
+    enable_nope_prolog_v3: bool = False
     # When True, keep MLAPO prefill weights on NPU instead of freeing them
     # on kv_consumer D nodes. Trades NPU memory for stability — D nodes have
     # normal local-prefill paths (recompute / fallback / preempt) that crash

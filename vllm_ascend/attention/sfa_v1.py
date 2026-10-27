@@ -28,6 +28,7 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     get_pcp_num_replicated_tokens,
     is_pcp_decode_sharding_enabled,
 )
+from vllm_ascend.attention.nope_prolog import dequantize_nope_query, nope_prolog_unsupported_reasons
 from vllm_ascend.attention.sparse_flash_mla import sparse_flash_mla, sparse_flash_mla_metadata
 from vllm_ascend.attention.utils import (
     MLAPO_MAX_SUPPORTED_TOKENS,
@@ -45,6 +46,7 @@ from vllm_ascend.attention.utils import (
     transdata,
     wait_for_kv_layer_from_connector,
 )
+from vllm_ascend.device.device_config import get_ascend_device_type
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
@@ -896,6 +898,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.preprocess_type = PreprocessType.NATIVE
 
         self.enable_mlapo = bool(get_ascend_config().enable_mlapo)
+        self.enable_nope_prolog_v3 = getattr(ascend_config, "enable_nope_prolog_v3", False)
 
         self.enable_sp = enable_sp()
 
@@ -1010,6 +1013,18 @@ class AscendSFAImpl(MLAAttentionImpl):
         quant_method = self._get_layer_quant_method(self.fused_qkv_a_proj)
         self._quant_type = type(quant_method) if quant_method is not None else None
 
+        if self.qk_rope_head_dim == 0 and getattr(self, "enable_nope_prolog_v3", False):
+            reasons = self._get_fused_type_unsupported_reasons(PreprocessType.PROLOG_V3)
+            if act_dtype != torch.bfloat16:
+                reasons.append("NoPE Prolog V3 requires bfloat16 activations.")
+            if getattr(self, "dcp_group", None) is not None:
+                reasons.append("NoPE Prolog V3 does not support context parallelism.")
+            if reasons:
+                raise ValueError("enable_nope_prolog_v3 cannot be enabled: " + " ".join(reasons))
+            self._process_weights_for_fused_prolog_v3()
+            logger.info_once("NoPE SFA preprocessing: PROLOG_V3 (PR14225, W8A8C8).")
+            return PreprocessType.PROLOG_V3
+
         pp_type = self._fused_preprocess_type()
         if pp_type is not None and self._try_enable_type(pp_type, act_dtype):
             return pp_type
@@ -1059,7 +1074,10 @@ class AscendSFAImpl(MLAAttentionImpl):
     def _get_fused_type_unsupported_reasons(self, pp_type: PreprocessType) -> list[str]:
         reasons = []
         if self.qk_rope_head_dim == 0:
-            reasons.append("NoPE SFA currently uses native preprocessing; fused NoPE contracts are not enabled.")
+            if pp_type is not PreprocessType.PROLOG_V3 or not getattr(self, "enable_nope_prolog_v3", False):
+                reasons.append("NoPE fused preprocessing requires enable_nope_prolog_v3=True and PROLOG_V3.")
+            else:
+                reasons.extend(self._get_nope_prolog_unsupported_reasons())
         if self.kv_a_layernorm is None or self.q_a_layernorm is None:
             reasons.append("Fused preprocessing requires q_a_layernorm and kv_a_layernorm.")
         if self.fused_qkv_a_proj is None:
@@ -1068,10 +1086,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         quant_method = self._get_layer_quant_method(self.fused_qkv_a_proj)
         qt = type(quant_method) if quant_method is not None else None
         if pp_type is PreprocessType.PROLOG_V3:
-            # Prolog's indexer query can carry quantization scales independently
-            # of the MLA weight type. Preserve the native query for an
-            # unquantized indexer, including layers that later toggle skip_topk.
-            if self.has_indexer:
+            # NoPE dequantizes query_norm for KPool. Keep the existing admission
+            # contract for RoPE indexers, including layers that toggle skip_topk.
+            if self.has_indexer and self.qk_rope_head_dim != 0:
                 wq_b = getattr(self.indexer, "wq_b", None)
                 if not hasattr(wq_b, "weight_scale"):
                     reasons.append("PROLOG_V3 requires a quantized indexer query projection.")
@@ -1087,6 +1104,34 @@ class AscendSFAImpl(MLAAttentionImpl):
             elif self.enable_sparse_sfa_c8:
                 reasons.append("MLAPO does not support sparse C8; use PROLOG_V3 instead.")
 
+        return reasons
+
+    def _get_nope_prolog_unsupported_reasons(self) -> list[str]:
+        # This is the exact Dr=0 subset admitted by PR14225, not every V3
+        # quantization mode. Check loaded weights before preparing NZ copies.
+        projections = (self.fused_qkv_a_proj, self.q_proj)
+        dynamic_int8 = all(
+            type(self._get_layer_quant_method(proj)) is AscendW8A8DynamicLinearMethod
+            and getattr(getattr(proj, "weight", None), "dtype", None) == torch.int8
+            and hasattr(proj, "weight_scale")
+            for proj in projections
+        )
+        reasons = nope_prolog_unsupported_reasons(
+            device_type=get_ascend_device_type().name,
+            cache_dtype=getattr(self, "c8_cache_dtype", None) if self.enable_sparse_sfa_c8 else None,
+            dynamic_int8_projections=dynamic_int8,
+            activation_dtype=self.W_UK_T.dtype,
+            hidden_size=getattr(self.fused_qkv_a_proj, "input_size", 0),
+            q_lora_rank=self.q_lora_rank,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            num_heads=self.local_num_heads,
+        )
+        for norm in (self.q_a_layernorm, self.kv_a_layernorm):
+            if norm is not None and norm.weight.dtype != torch.bfloat16:
+                reasons.append("NoPE Prolog V3 requires bfloat16 normalization weights.")
+        if not hasattr(torch_npu, "npu_mla_prolog_v3"):
+            reasons.append("torch_npu does not expose npu_mla_prolog_v3.")
         return reasons
 
     def _process_weights_for_fused_prolog_v3(self) -> None:
@@ -1434,8 +1479,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             kr_cache = self.sfa_qsfa_kr_cache_dummy
         else:
             kr_cache = kv_cache[1]
-        rope_cos_ = cos.view(cos.shape[0], cos.shape[-1])
-        rope_sin_ = sin.view(sin.shape[0], sin.shape[-1])
+        if self.qk_rope_head_dim == 0:
+            # Rank must remain 2 even though numel is zero: V3 infers Dr from
+            # the last dimension. NoPE metadata intentionally has no cos/sin.
+            rope_cos_ = hidden_states.new_empty((hidden_states.shape[0], 0))
+            rope_sin_ = rope_cos_
+        else:
+            rope_cos_ = cos.view(cos.shape[0], cos.shape[-1])
+            rope_sin_ = sin.view(sin.shape[0], sin.shape[-1])
         # The caller forwards the per-step cached int64 slots, so the .to()
         # below is a no-op in production; kept for direct-call safety.
         cache_index = slot_mapping.view(-1).to(torch.int64)
@@ -1486,12 +1537,18 @@ class AscendSFAImpl(MLAAttentionImpl):
             **extra_kwargs,
         )
         num_h = self.local_num_heads
-        ql_nope = ql_nope.view(-1, num_h, self.kv_lora_rank)
-        q_pe = q_pe.view(-1, num_h, self.qk_rope_head_dim)
+        ql_nope = ql_nope.view(hidden_states.shape[0], num_h, self.kv_lora_rank)
+        # An inferred -1 is ambiguous when Dr=0. Preserve all graph bucket rows.
+        q_pe = q_pe.view(hidden_states.shape[0], num_h, self.qk_rope_head_dim)
 
         if self.has_indexer:
             if q_c is None:
                 raise RuntimeError("npu_mla_prolog_v3 did not return query_norm for SFA indexer.")
+            if self.qk_rope_head_dim == 0:
+                q_c = dequantize_nope_query(
+                    q_c, q_c_scale, hidden_states.shape[0], self.q_lora_rank, hidden_states.dtype
+                )
+                return hidden_states, ql_nope, q_pe, q_c
             q_c = q_c.view(-1, self.q_lora_rank)
             if q_c_scale is not None:
                 if qt is AscendW8A8MXFP8DynamicLinearMethod:
@@ -1976,7 +2033,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     # npu_mla_prolog_v3 requires int64 cache indices; reuse
                     # the per-step conversion so all layers of a step share
                     # one Cast kernel (the .to() inside is a no-op on int64).
-                    slot_mapping=_int64_kv_slots(slot_mapping_sfa, attn_metadata),
+                    slot_mapping=_int64_kv_slots(slot_mapping_sfa, attn_metadata)[:num_input_tokens],
                     attn_metadata=attn_metadata,
                 )
             else:
