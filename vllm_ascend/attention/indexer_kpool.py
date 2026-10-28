@@ -31,6 +31,8 @@ from vllm_ascend.core.kv_cache_interface import (
     get_storage_block_size,
 )
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_current_hardware_profile
+from vllm_ascend.ops.mla_prolog import MX_GROUP_SIZE
+from vllm_ascend.quantization.methods import AscendW8A8MXFP8DynamicLinearMethod
 from vllm_ascend.utils import _round_up, enable_dsa_cp
 
 GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE = 128
@@ -645,6 +647,39 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
             raise TypeError(f"GLM KPool cache {layer.prefix!r} is not bound to a tensor.")
         return cache
 
+    def _get_query_input(
+        self, q_c: torch.Tensor | tuple[torch.Tensor, torch.Tensor], num_tokens: int
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if not isinstance(q_c, tuple):
+            return q_c[:num_tokens]
+        method = getattr(getattr(self.wq_b, "quant_method", None), "quant_method", None)
+        if type(method) is not AscendW8A8MXFP8DynamicLinearMethod:
+            raise TypeError("GLM KPool quantized q_c requires an MXFP8 query projection.")
+        if any(getattr(self.wq_b, "mxfp8_tp_padding", (0, 0))):
+            raise ValueError("GLM KPool quantized q_c does not support TP input padding.")
+        if len(q_c) != 2:
+            raise ValueError("GLM KPool quantized q_c requires (values, scales).")
+        values, scales = q_c
+        if not isinstance(values, torch.Tensor) or not isinstance(scales, torch.Tensor):
+            raise TypeError("GLM KPool quantized q_c values and scales must be tensors.")
+        if method.group_size != MX_GROUP_SIZE:
+            raise ValueError("GLM KPool quantized q_c requires group size 32.")
+        if values.dtype != torch.float8_e4m3fn or scales.dtype != torch.float8_e8m0fnu:
+            raise TypeError("GLM KPool quantized q_c requires E4M3 values and E8M0 scales.")
+        if (
+            values.ndim != 2
+            or values.shape[0] < num_tokens
+            or values.shape[1] != self.q_lora_rank
+            or values.shape[1] % MX_GROUP_SIZE
+            or not values.is_contiguous()
+            or not scales.is_contiguous()
+            or scales.shape != (values.shape[0], values.shape[1] // MX_GROUP_SIZE)
+            or values.device != scales.device
+        ):
+            raise ValueError("GLM KPool quantized q_c requires per-token, per-32 scales.")
+        # The existing MXFP8 linear consumes this tuple without re-quantizing.
+        return values[:num_tokens], scales[:num_tokens]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -674,9 +709,7 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         q_values = None
         weights = None
         if compute_topk:
-            if isinstance(q_c, tuple):
-                raise TypeError("GLM KPool backend requires an unquantized q_c tensor.")
-            q_values = self.wq_b(q_c[:num_tokens])[0].view(num_tokens, self.n_head, self.head_dim)
+            q_values = self.wq_b(self._get_query_input(q_c, num_tokens))[0].view(num_tokens, self.n_head, self.head_dim)
             weights = F.linear(hidden.float(), self._head_weight_f32).to(q_values.dtype)
             weights = weights * (self.softmax_scale * self.n_head**-0.5)
 

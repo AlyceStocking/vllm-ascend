@@ -1,0 +1,514 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""CPU integration contracts extracted from the actual SFA/Indexer source.
+
+This deliberately compiles selected AST methods, not either complete production
+module: vLLM, NPU kernels and their import-time registrations are not exercised.
+Run with --confcutdir=tests/ut/attention to bypass global NPU fixtures.
+"""
+
+import ast
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch
+
+ROOT = Path(__file__).resolve().parents[3]
+SFA_PATH = ROOT / "vllm_ascend/attention/sfa_v1.py"
+INDEXER_PATH = ROOT / "vllm_ascend/attention/indexer_kpool.py"
+HIDDEN_SIZE = 1024
+Q_LORA_RANK = 640
+KV_LORA_RANK = 512
+NUM_HEADS = 2
+
+
+class Mxfp8Method:
+    group_size = 32
+    dynamic_mx_quant_scale_alg = 0
+
+
+class DynamicMethod:
+    pass
+
+
+class StaticMethod:
+    pass
+
+
+def _extract_class(path, class_name, names, namespace):
+    """Execute unchanged selected methods; fail if production names disappear."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    source_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
+    methods = [node for node in source_class.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    assert {node.name for node in methods} == set(names)
+    extracted = ast.ClassDef(name=class_name, bases=[], keywords=[], body=methods, decorator_list=[])
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), extracted],
+        type_ignores=[],
+    )
+    namespace = dict(namespace, torch=torch)
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace[class_name]
+
+
+def _quant_globals():
+    return dict(
+        MX_GROUP_SIZE=32,
+        AscendW8A8MXFP8DynamicLinearMethod=Mxfp8Method,
+        AscendW8A8DynamicLinearMethod=DynamicMethod,
+        AscendW8A8LinearMethod=StaticMethod,
+    )
+
+
+@pytest.mark.parametrize("tokens", [0, 3])
+@pytest.mark.parametrize("cache_quant", [False, True])
+@pytest.mark.parametrize("with_scale", [False, True])
+def test_shared_forward_nope_shapes_and_indexer_scales(tokens, cache_quant, with_scale):
+    x_quant = torch.zeros((tokens, HIDDEN_SIZE), dtype=torch.uint8).view(torch.float8_e4m3fn)
+    x_scale = torch.zeros((tokens, HIDDEN_SIZE // 32), dtype=torch.uint8)
+    q_norm = torch.zeros((tokens, Q_LORA_RANK), dtype=torch.uint8).view(torch.float8_e4m3fn)
+    q_scale = torch.zeros((tokens, Q_LORA_RANK // 32), dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    if not with_scale:
+        q_scale = torch.empty(0, dtype=torch.float8_e8m0fnu)
+    adapter = Mock(
+        return_value=(
+            torch.empty((tokens, NUM_HEADS, KV_LORA_RANK), dtype=torch.bfloat16),
+            torch.empty((tokens, NUM_HEADS, 0), dtype=torch.bfloat16),
+            torch.empty(0, dtype=torch.float32),
+            q_norm,
+            q_scale,
+        )
+    )
+    npu = SimpleNamespace(npu_dynamic_mx_quant=Mock(return_value=(x_quant, x_scale)))
+    cls = _extract_class(
+        SFA_PATH,
+        "AscendSFAImpl",
+        ["_sfa_preprocess_prolog_v3", "_uses_cannbot_prolog"],
+        dict(_quant_globals(), mla_prolog=adapter, torch_npu=npu),
+    )
+    impl = cls()
+    impl._quant_type = Mxfp8Method
+    impl._mla_prolog_backend = "cannbot"
+    impl._mla_prolog_prepared = object()
+    impl.enable_sparse_sfa_c8 = cache_quant
+    impl.has_indexer = True
+    impl.local_num_heads = NUM_HEADS
+    impl.qk_rope_head_dim = 0
+    impl.kv_lora_rank = KV_LORA_RANK
+    impl.q_lora_rank = Q_LORA_RANK
+    impl.q_a_layernorm = SimpleNamespace(weight=torch.ones(Q_LORA_RANK), variance_epsilon=1e-6)
+    impl.kv_a_layernorm = SimpleNamespace(weight=torch.ones(KV_LORA_RANK), variance_epsilon=1e-6)
+    impl.sfa_qsfa_tile_size = 128
+    impl.sfa_qsfa_k_nope_clip_alpha = None
+    impl.sfa_qsfa_kr_cache_dummy = torch.empty(0)
+    for name in ("weight_dq", "weight_dkv_kr", "weight_uq_qr", "W_UK_T"):
+        setattr(impl, name, object())
+    for name in ("weight_dq_scale", "weight_dkv_kr_scale", "weight_uq_qr_scale"):
+        setattr(impl, name, torch.zeros(1, dtype=torch.uint8))
+    hidden = torch.zeros((tokens, HIDDEN_SIZE), dtype=torch.bfloat16)
+    cache = torch.empty((2, 16, 528 if cache_quant else 512), dtype=torch.uint8 if cache_quant else torch.bfloat16)
+    slots = torch.arange(tokens, dtype=torch.int64)
+    # A NoPE layer has no second (KR) cache; this catches accidental tuple indexing.
+    hidden_out, query, rope, latent = impl._sfa_preprocess_prolog_v3(hidden, (cache,), None, None, slots)
+    assert hidden_out is hidden
+    assert query.shape == (tokens, NUM_HEADS, KV_LORA_RANK)
+    assert rope.shape == (tokens, NUM_HEADS, 0)
+    # (0, Q/32) is a valid T0 MX scale tensor; only (0,) means absent.
+    if with_scale:
+        assert isinstance(latent, tuple) and len(latent) == 2
+        assert latent[0].shape == (tokens, Q_LORA_RANK)
+        assert latent[1].shape == (tokens, Q_LORA_RANK // 32)
+        assert latent[1].dtype == torch.float8_e8m0fnu
+    else:
+        assert isinstance(latent, torch.Tensor)
+        assert latent.shape == (tokens, Q_LORA_RANK)
+    if tokens:
+        npu.npu_dynamic_mx_quant.assert_called_once_with(hidden, dst_type=torch.float8_e4m3fn)
+    else:
+        npu.npu_dynamic_mx_quant.assert_not_called()
+    adapter.assert_called_once()
+    call = adapter.call_args.kwargs
+    assert call["backend"] == "cannbot"
+    assert call["prepared"] is impl._mla_prolog_prepared
+    if tokens:
+        assert call["token_x"] is x_quant
+    else:
+        assert call["token_x"].shape == (0, HIDDEN_SIZE)
+        assert call["token_x"].dtype == torch.float8_e4m3fn
+    assert call["kv_cache"] is cache
+    assert call["rope_sin"] is None and call["rope_cos"] is None
+    assert call["kr_cache"] is None or call["kr_cache"].numel() == 0
+    assert call["dequant_scale_x"].shape == (tokens, HIDDEN_SIZE // 32)
+    assert call["kv_cache_quant_mode"] == (3 if cache_quant else 0)
+
+
+def _projection(method=None):
+    return SimpleNamespace(
+        quant_method=SimpleNamespace(quant_method=method or Mxfp8Method()),
+        bias=None,
+        mxfp8_tp_padding=(0, 0),
+        weight_scale=torch.empty(1),
+    )
+
+
+@pytest.fixture
+def routing():
+    pp = SimpleNamespace(NATIVE=object(), PROLOG_V3=object(), MLAPO=object())
+    family = SimpleNamespace(FP8_OPTIMIZED=object())
+    profile = SimpleNamespace(device_adaptor_family=family.FP8_OPTIMIZED)
+    ascend = SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(enabled=False))
+    cp = Mock(return_value=False)
+    names = [
+        "_uses_cannbot_prolog",
+        "_cannbot_config_unsupported_reasons",
+        "_get_layer_quant_method",
+        "_resolve_preprocess_type",
+        "_fused_preprocess_type",
+        "_get_fused_type_unsupported_reasons",
+        "_try_enable_type",
+    ]
+    cls = _extract_class(
+        SFA_PATH,
+        "AscendSFAImpl",
+        names,
+        dict(
+            _quant_globals(),
+            PreprocessType=pp,
+            DeviceAdaptorFamily=family,
+            get_current_hardware_profile=lambda: profile,
+            get_ascend_config=lambda: ascend,
+            enable_dsa_cp=cp,
+            logger=Mock(),
+        ),
+    )
+    impl = cls()
+    impl._mla_prolog_backend = "cannbot"
+    impl.qk_rope_head_dim = 0
+    impl.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=True),
+        kv_transfer_config=None,
+        speculative_config=None,
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1, decode_context_parallel_size=1),
+    )
+    impl.rl_weight_update_enabled = False
+    impl.enable_sp = False
+    impl.enable_sparse_sfa_turboquant = False
+    impl.enable_sparse_sfa_c8 = False
+    impl.c8_cache_dtype = torch.float8_e4m3fn
+    impl.fused_qkv_a_proj = _projection()
+    impl.q_proj = _projection()
+    impl.indexer = SimpleNamespace(wq_b=_projection())
+    impl.has_indexer = True
+    impl.q_a_layernorm = object()
+    impl.kv_a_layernorm = object()
+    impl.is_kv_consumer = False
+    impl.enable_mlapo = False
+    impl._process_weights_for_fused_prolog_v3 = Mock()
+    impl._process_weights_for_fused_mlapo = Mock()
+    return SimpleNamespace(impl=impl, pp=pp, profile=profile, ascend=ascend, cp=cp)
+
+
+def test_default_nope_remains_native(routing):
+    impl = routing.impl
+    del impl._mla_prolog_backend
+    assert not impl._uses_cannbot_prolog()
+    assert impl._resolve_preprocess_type(torch.bfloat16) is routing.pp.NATIVE
+    impl._process_weights_for_fused_prolog_v3.assert_not_called()
+
+
+def test_explicit_nope_eager_a5_mxfp8_selects_prolog(routing):
+    impl = routing.impl
+    assert impl._cannbot_config_unsupported_reasons() == []
+    assert impl._resolve_preprocess_type(torch.bfloat16) is routing.pp.PROLOG_V3
+    impl._process_weights_for_fused_prolog_v3.assert_called_once_with()
+    impl._process_weights_for_fused_mlapo.assert_not_called()
+
+
+def test_rope_never_selects_cannbot(routing):
+    routing.impl.qk_rope_head_dim = 64
+    assert not routing.impl._uses_cannbot_prolog()
+
+
+@pytest.mark.parametrize(
+    "case,reason",
+    [
+        ("hardware", "A5"),
+        ("graph", "eager"),
+        ("rl", "RL"),
+        ("pd", "PD"),
+        ("speculative", "speculative"),
+        ("pcp", "parallel"),
+        ("dcp", "parallel"),
+        ("sp", "parallel"),
+        ("dsa_cp", "parallel"),
+        ("offload", "offload"),
+        ("turboquant", "TurboQuant"),
+    ],
+)
+def test_unsupported_configuration_fails_without_prepare(routing, case, reason):
+    impl = routing.impl
+    config = impl.vllm_config
+    if case == "hardware":
+        routing.profile.device_adaptor_family = object()
+    elif case == "graph":
+        config.model_config.enforce_eager = False
+    elif case == "rl":
+        impl.rl_weight_update_enabled = True
+    elif case == "pd":
+        config.kv_transfer_config = object()
+    elif case == "speculative":
+        config.speculative_config = object()
+    elif case == "pcp":
+        config.parallel_config.prefill_context_parallel_size = 2
+    elif case == "dcp":
+        config.parallel_config.decode_context_parallel_size = 2
+    elif case == "sp":
+        impl.enable_sp = True
+    elif case == "dsa_cp":
+        routing.cp.return_value = True
+    elif case == "offload":
+        routing.ascend.sparse_kv_offload_config.enabled = True
+    else:
+        impl.enable_sparse_sfa_turboquant = True
+    with pytest.raises(ValueError, match=reason):
+        impl._resolve_preprocess_type(torch.bfloat16)
+    impl._process_weights_for_fused_prolog_v3.assert_not_called()
+
+
+@pytest.mark.parametrize("projection", ["fused_qkv_a_proj", "q_proj", "indexer"])
+@pytest.mark.parametrize("failure", ["quant", "bias", "padding"])
+def test_incompatible_projection_is_rejected(routing, projection, failure):
+    layer = routing.impl.indexer.wq_b if projection == "indexer" else getattr(routing.impl, projection)
+    if failure == "quant":
+        layer.quant_method.quant_method = DynamicMethod()
+    elif failure == "bias":
+        layer.bias = torch.zeros(1)
+    else:
+        layer.mxfp8_tp_padding = (0, 16)
+    with pytest.raises(ValueError, match="MXFP8|bias|padding"):
+        routing.impl._resolve_preprocess_type(torch.bfloat16)
+    routing.impl._process_weights_for_fused_prolog_v3.assert_not_called()
+
+
+def test_cannbot_rejects_fp16_model(routing):
+    with pytest.raises(ValueError, match="BF16"):
+        routing.impl._resolve_preprocess_type(torch.float16)
+    routing.impl._process_weights_for_fused_prolog_v3.assert_not_called()
+
+
+def test_cannbot_rejects_int8_cache(routing):
+    routing.impl.enable_sparse_sfa_c8 = True
+    routing.impl.c8_cache_dtype = torch.int8
+    with pytest.raises(ValueError, match="FP8|INT8"):
+        routing.impl._resolve_preprocess_type(torch.bfloat16)
+
+
+@pytest.fixture
+def indexer():
+    cls = _extract_class(INDEXER_PATH, "Glm5NextKPoolIndexerBackend", ["_get_query_input"], _quant_globals())
+    impl = cls()
+    impl.wq_b = _projection()
+    impl.q_lora_rank = Q_LORA_RANK
+    return impl
+
+
+def _query_tuple(tokens=5):
+    values = torch.arange(tokens * Q_LORA_RANK).to(torch.uint8).reshape(tokens, Q_LORA_RANK)
+    scales = torch.arange(tokens * (Q_LORA_RANK // 32)).to(torch.uint8).reshape(tokens, Q_LORA_RANK // 32)
+    return values.view(torch.float8_e4m3fn), scales.view(torch.float8_e8m0fnu)
+
+
+@pytest.mark.parametrize("tokens", [0, 3, 5])
+def test_indexer_slices_both_quantized_values_and_scales_without_copy(indexer, tokens):
+    values, scales = _query_tuple()
+    result = indexer._get_query_input((values, scales), tokens)
+    assert isinstance(result, tuple) and len(result) == 2
+    for actual, source in zip(result, (values, scales)):
+        assert actual.shape == (tokens, source.shape[1])
+        assert actual.dtype == source.dtype
+        assert actual.untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
+        assert torch.equal(actual.view(torch.uint8), source[:tokens].view(torch.uint8))
+
+
+def test_indexer_accepts_empty_mx_tuple(indexer):
+    values, scales = _query_tuple(tokens=0)
+    result = indexer._get_query_input((values, scales), 0)
+    assert isinstance(result, tuple)
+    assert result[0].shape == (0, Q_LORA_RANK)
+    assert result[1].shape == (0, Q_LORA_RANK // 32)
+    assert result[1].dtype == torch.float8_e8m0fnu
+
+
+def test_indexer_preserves_unquantized_input_path(indexer):
+    values = torch.arange(5 * Q_LORA_RANK, dtype=torch.float32).reshape(5, Q_LORA_RANK)
+    result = indexer._get_query_input(values, 3)
+    torch.testing.assert_close(result, values[:3])
+    assert result.untyped_storage().data_ptr() == values.untyped_storage().data_ptr()
+
+
+@pytest.mark.parametrize("method", [DynamicMethod(), StaticMethod(), None])
+def test_indexer_rejects_tuple_for_other_quantizers(indexer, method):
+    indexer.wq_b.quant_method.quant_method = method
+    with pytest.raises(TypeError, match="MXFP8"):
+        indexer._get_query_input(_query_tuple(), 3)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "padding",
+        "length",
+        "values_dtype",
+        "scale_dtype",
+        "scale_shape",
+        "tokens",
+        "width",
+        "values_not_tensor",
+        "scales_not_tensor",
+        "group",
+        "values_stride",
+        "scales_stride",
+        "device",
+    ],
+)
+def test_indexer_rejects_malformed_tuple(indexer, case):
+    values, scales = _query_tuple()
+    query = (values, scales)
+    tokens = 3
+    if case == "padding":
+        indexer.wq_b.mxfp8_tp_padding = (16, 0)
+    elif case == "length":
+        query = (values,)
+    elif case == "values_dtype":
+        query = (values.view(torch.uint8), scales)
+    elif case == "scale_dtype":
+        query = (values, scales.view(torch.uint8))
+    elif case == "scale_shape":
+        query = (values, scales[:, :-1])
+    elif case == "width":
+        # Internally matching per-32 scales are insufficient if Q is wrong.
+        query = (values[:, :512].contiguous(), scales[:, :16].contiguous())
+    elif case == "values_not_tensor":
+        query = (object(), scales)
+    elif case == "scales_not_tensor":
+        query = (values, object())
+    elif case == "group":
+        indexer.wq_b.quant_method.quant_method.group_size = 64
+    elif case == "values_stride":
+        strided = torch.zeros((5, Q_LORA_RANK * 2), dtype=torch.uint8)[:, ::2].view(torch.float8_e4m3fn)
+        assert not strided.is_contiguous()
+        query = (strided, scales)
+    elif case == "scales_stride":
+        strided = torch.zeros((5, Q_LORA_RANK // 16), dtype=torch.uint8)[:, ::2].view(torch.float8_e8m0fnu)
+        assert not strided.is_contiguous()
+        query = (values, strided)
+    elif case == "device":
+        # Metadata-only mismatch needs no accelerator or real NPU import.
+        query = (values, torch.empty(scales.shape, dtype=scales.dtype, device="meta"))
+    else:
+        tokens = 6
+    with pytest.raises((TypeError, ValueError)):
+        indexer._get_query_input(query, tokens)
+
+
+@pytest.mark.parametrize("field,value", [("group_size", 64), ("dynamic_mx_quant_scale_alg", 1)])
+def test_cannbot_rejects_incompatible_mx_scale_parameters(routing, field, value):
+    setattr(routing.impl.q_proj.quant_method.quant_method, field, value)
+    with pytest.raises(ValueError, match="per-32|scale_alg"):
+        routing.impl._resolve_preprocess_type(torch.bfloat16)
+    routing.impl._process_weights_for_fused_prolog_v3.assert_not_called()
+
+
+def test_prepare_hook_splits_loaded_weights_without_mutating_source():
+    prepare = Mock(return_value=object())
+    npu = SimpleNamespace(npu_format_cast=Mock(side_effect=lambda tensor, fmt: tensor.clone()))
+    cls = _extract_class(
+        SFA_PATH,
+        "AscendSFAImpl",
+        ["_uses_cannbot_prolog", "_process_weights_for_fused_prolog_v3", "_prepare_cannbot_prolog_weights"],
+        dict(_quant_globals(), torch_npu=npu, prepare_mla_prolog=prepare, ACL_FORMAT_FRACTAL_ND=2, logger=Mock()),
+    )
+    impl = cls()
+    impl._mla_prolog_backend = "cannbot"
+    impl.qk_rope_head_dim = 0
+    impl.q_lora_rank = Q_LORA_RANK
+    width = Q_LORA_RANK + KV_LORA_RANK
+    fused = torch.arange(HIDDEN_SIZE * width).to(torch.uint8).reshape(HIDDEN_SIZE, width)
+    scales = torch.arange((HIDDEN_SIZE // 64) * width * 2).to(torch.uint8).reshape(HIDDEN_SIZE // 64, width, 2)
+    q_weight = torch.zeros((Q_LORA_RANK, NUM_HEADS * 256), dtype=torch.uint8)
+    q_scales = torch.zeros((Q_LORA_RANK // 64, NUM_HEADS * 256, 2), dtype=torch.uint8)
+    impl.fused_qkv_a_proj = SimpleNamespace(weight=fused.view(torch.float8_e4m3fn), weight_scale=scales)
+    impl.q_proj = SimpleNamespace(weight=q_weight.view(torch.float8_e4m3fn), weight_scale=q_scales)
+    impl.W_UK_T = torch.zeros((NUM_HEADS, 256, KV_LORA_RANK), dtype=torch.bfloat16)
+    impl.q_a_layernorm = SimpleNamespace(weight=torch.ones(Q_LORA_RANK), variance_epsilon=1e-6)
+    impl.kv_a_layernorm = SimpleNamespace(weight=torch.ones(KV_LORA_RANK), variance_epsilon=1e-6)
+    originals = [impl.fused_qkv_a_proj.weight, scales, impl.q_proj.weight, q_scales, impl.W_UK_T]
+    snapshots = [(tensor.clone(), tensor.untyped_storage().data_ptr()) for tensor in originals]
+    impl._process_weights_for_fused_prolog_v3()
+    prepare.assert_called_once()
+    assert impl._mla_prolog_prepared is prepare.return_value
+    call = prepare.call_args.kwargs
+    assert torch.equal(call["weight_dq"].view(torch.uint8), fused[:, :Q_LORA_RANK])
+    assert torch.equal(call["weight_dkv_kr"].view(torch.uint8), fused[:, Q_LORA_RANK:])
+    assert torch.equal(call["dequant_scale_w_dq"], scales[:, :Q_LORA_RANK, :])
+    assert torch.equal(call["dequant_scale_w_dkv_kr"], scales[:, Q_LORA_RANK:, :])
+    assert call["weight_uk"] is impl.W_UK_T
+    assert all(call.args[1] == 2 for call in npu.npu_format_cast.call_args_list)
+    for original, (snapshot, pointer) in zip(originals, snapshots):
+        assert original.untyped_storage().data_ptr() == pointer
+        assert torch.equal(original.view(torch.uint8), snapshot.view(torch.uint8))
+
+
+@pytest.mark.parametrize("compute_topk", [False, True])
+def test_indexer_forward_passes_sliced_mx_tuple_to_query_projection(compute_topk):
+    metadata_type = type("Metadata", (SimpleNamespace,), {})
+    tail_type = type("TailMetadata", (SimpleNamespace,), {})
+    metadata = metadata_type(query_metadata=None, num_actual_tokens=3, pcp_hidden_restore_indices=None)
+    tail = tail_type()
+    context = SimpleNamespace(attn_metadata={"tail": tail}, cudagraph_runtime_mode="eager")
+    cls = _extract_class(
+        INDEXER_PATH,
+        "Glm5NextKPoolIndexerBackend",
+        ["_get_query_input", "forward"],
+        dict(
+            _quant_globals(),
+            AscendIndexerKPoolMetadata=metadata_type,
+            AscendIndexerKPoolTailMetadata=tail_type,
+            get_forward_context=lambda: context,
+            CUDAGraphMode=SimpleNamespace(FULL="full"),
+            F=torch.nn.functional,
+        ),
+    )
+    impl = cls()
+    impl.tail_cache = SimpleNamespace(prefix="tail")
+    impl.k_cache = object()
+    impl._key_weight = torch.ones(1)
+    impl.n_head = NUM_HEADS
+    impl.head_dim = 4
+    impl.q_lora_rank = Q_LORA_RANK
+    impl.softmax_scale = 1.0
+    impl._head_weight_f32 = torch.ones((NUM_HEADS, HIDDEN_SIZE))
+    impl.wq_b = Mock(return_value=(torch.ones((3, NUM_HEADS * impl.head_dim), dtype=torch.bfloat16),))
+    impl.wq_b.quant_method = SimpleNamespace(quant_method=Mxfp8Method())
+    impl.wq_b.mxfp8_tp_padding = (0, 0)
+    impl._bound_cache = Mock(return_value=object())
+    impl._forward_cann = Mock(return_value=object())
+    values, scales = _query_tuple()
+    hidden = torch.ones((5, HIDDEN_SIZE), dtype=torch.bfloat16)
+    result = impl.forward(hidden, (values, scales), hidden, metadata, compute_topk=compute_topk)
+    assert result is impl._forward_cann.return_value
+    call = impl._forward_cann.call_args
+    assert call.args[0].shape[0] == 3
+    if compute_topk:
+        impl.wq_b.assert_called_once()
+        passed_values, passed_scales = impl.wq_b.call_args.args[0]
+        assert passed_values.shape == (3, Q_LORA_RANK)
+        assert passed_scales.shape == (3, Q_LORA_RANK // 32)
+        assert passed_values.untyped_storage().data_ptr() == values.untyped_storage().data_ptr()
+        assert passed_scales.untyped_storage().data_ptr() == scales.untyped_storage().data_ptr()
+        assert call.args[1].shape == (3, NUM_HEADS, impl.head_dim)
+    else:
+        impl.wq_b.assert_not_called()
+        assert call.args[1] is None and call.args[2] is None

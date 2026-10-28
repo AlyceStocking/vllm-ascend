@@ -29,6 +29,10 @@ from typing import Any
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Experimental MLA Prolog provider for NoPE SFA. Valid values: torch_npu
+    # (default, unchanged behavior) or cannbot (A5 MXFP8, eager only).
+    # Not sensitive. Cannbot is an optional, separately installed dependency.
+    "VLLM_ASCEND_MLA_PROLOG_BACKEND": lambda: os.getenv("VLLM_ASCEND_MLA_PROLOG_BACKEND", "torch_npu"),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
