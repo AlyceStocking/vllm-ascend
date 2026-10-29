@@ -42,6 +42,40 @@ def _load_adapter(monkeypatch):
 
 
 @pytest.fixture
+def packaged(monkeypatch):
+    name = "vllm_ascend.ops.packaged_mla_prolog"
+    if name not in sys.modules:
+        path = MODULE_PATH.with_name("packaged_mla_prolog.py")
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    module = sys.modules[name]
+    monkeypatch.setitem(sys.modules, "vllm_ascend.ops.packaged_mla_prolog", module)
+    module._get_dsl_op.cache_clear()
+    # Only tests register CPU execution; production still dispatches PrivateUse1.
+    library = torch.library.Library("vllm_ascend", "IMPL", "CPU")
+    try:
+        library.impl("quant_mla_prolog", module._quant_mla_prolog_impl)
+        yield module
+    finally:
+        library._destroy()
+        module._get_dsl_op.cache_clear()
+
+
+@pytest.fixture
+def vendor(monkeypatch, packaged):
+    kernel = PublicKernel()
+    public = ModuleType("ops.quant_mla_prolog")
+    public.quant_mla_prolog = kernel
+    package = ModuleType("ops")
+    package.__path__ = []
+    monkeypatch.setitem(sys.modules, "ops", package)
+    monkeypatch.setitem(sys.modules, "ops.quant_mla_prolog", public)
+    return kernel
+
+
+@pytest.fixture
 def npu(monkeypatch):
     module = ModuleType("torch_npu")
     module.npu_format_cast = Mock(side_effect=lambda tensor, fmt: tensor.clone())
@@ -51,7 +85,7 @@ def npu(monkeypatch):
 
 
 @pytest.fixture
-def adapter(monkeypatch, npu):
+def adapter(monkeypatch, npu, packaged):
     return _load_adapter(monkeypatch)
 
 
@@ -150,8 +184,8 @@ class PublicKernel:
 
 
 @pytest.fixture
-def prepared(adapter, weights):
-    return adapter.prepare_mla_prolog(**weights, quant_mla_prolog=PublicKernel())
+def prepared(adapter, weights, vendor):
+    return adapter.prepare_mla_prolog(**weights)
 
 
 def _inputs(weights, tokens=3, *, cache_quant=False, query_norm=True):
@@ -210,11 +244,12 @@ def test_default_resolves_only_mocked_torch_npu(adapter, npu, monkeypatch):
     npu.npu_mla_prolog_v3.assert_called_once_with(token_x=None)
 
 
-def test_explicit_backend_missing_dependency_is_actionable(adapter, weights, monkeypatch):
+def test_missing_dependency_is_lazy_and_actionable(adapter, weights, monkeypatch):
     monkeypatch.setitem(sys.modules, "ops", None)
     monkeypatch.setitem(sys.modules, "ops.quant_mla_prolog", None)
+    state = adapter.prepare_mla_prolog(**weights)
     with pytest.raises((ImportError, RuntimeError), match="(?i)cannbot|quant_mla_prolog"):
-        adapter.prepare_mla_prolog(**weights)
+        _forward(adapter, state, _inputs(weights))
 
 
 def test_resolves_public_vendor_entrypoint(adapter, weights, monkeypatch):
@@ -247,7 +282,7 @@ def test_prepare_layout_bitview_and_original_parameters_unchanged(adapter, weigh
         for name, value in weights.items()
         if isinstance(value, torch.Tensor)
     }
-    state = adapter.prepare_mla_prolog(**weights, quant_mla_prolog=PublicKernel())
+    state = adapter.prepare_mla_prolog(**weights)
     for source, destination in (("weight_dq", "wqa"), ("weight_uq_qr", "wqb"), ("weight_dkv_kr", "wkva")):
         packed = getattr(state, destination)
         assert packed.dtype == torch.float8_e4m3fn
@@ -283,13 +318,13 @@ def test_prepare_layout_bitview_and_original_parameters_unchanged(adapter, weigh
 @pytest.mark.parametrize("query_norm", [False, True])
 @pytest.mark.parametrize("cache_quant", [False, True])
 def test_five_outputs_keep_quantized_latent_separate_from_rope(
-    adapter, prepared, weights, npu, query_norm, cache_quant
+    adapter, prepared, weights, npu, query_norm, cache_quant, vendor
 ):
     inputs = _inputs(weights, cache_quant=cache_quant, query_norm=query_norm)
     output = _forward(adapter, prepared, inputs)
     assert len(output) == 5
     q, rope, q_scale, q_norm, q_norm_scale = output
-    vendor_output = prepared.kernel.outputs[-1]
+    vendor_output = vendor.outputs[-1]
     assert q.shape == (3, NUM_HEADS, KV_LORA_RANK)
     assert q.dtype == torch.bfloat16
     torch.testing.assert_close(q, vendor_output[0])
@@ -302,7 +337,7 @@ def test_five_outputs_keep_quantized_latent_separate_from_rope(
     assert q_norm_scale.dtype == torch.float8_e8m0fnu
     _assert_bytes_equal(q_norm, vendor_output[2])
     _assert_bytes_equal(q_norm_scale, vendor_output[3])
-    call = prepared.kernel.calls[-1]
+    call = vendor.calls[-1]
     assert call["x"] is inputs["token_x"]
     assert call["descale_x"].dtype == torch.float8_e8m0fnu
     assert _storage(call["descale_x"]) == _storage(inputs["dequant_scale_x"])
@@ -318,7 +353,9 @@ def test_five_outputs_keep_quantized_latent_separate_from_rope(
 
 @pytest.mark.parametrize("query_norm", [False, True])
 @pytest.mark.parametrize("cache_quant", [False, True])
-def test_zero_tokens_preserve_five_output_shapes_without_launch(adapter, prepared, weights, query_norm, cache_quant):
+def test_zero_tokens_preserve_five_output_shapes_without_launch(
+    adapter, prepared, weights, query_norm, cache_quant, vendor
+):
     output = _forward(adapter, prepared, _inputs(weights, 0, cache_quant=cache_quant, query_norm=query_norm))
     assert len(output) == 5
     assert [tuple(t.shape) for t in output] == [
@@ -335,12 +372,12 @@ def test_zero_tokens_preserve_five_output_shapes_without_launch(adapter, prepare
         torch.float8_e4m3fn,
         torch.float8_e8m0fnu,
     ]
-    assert not prepared.kernel.calls
+    assert not vendor.calls
 
 
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.uint8, torch.int8, torch.float8_e4m3fn])
 @pytest.mark.parametrize("rank", [3, 4])
-def test_cache_views_alias_original_storage(adapter, prepared, weights, cache_dtype, rank):
+def test_cache_views_alias_original_storage(adapter, prepared, weights, cache_dtype, rank, vendor):
     inputs = _inputs(weights, cache_quant=cache_dtype != torch.bfloat16)
     # An offset, contiguous slice must preserve its storage offset as well.
     original = inputs["kv_cache"].view(cache_dtype)
@@ -351,7 +388,7 @@ def test_cache_views_alias_original_storage(adapter, prepared, weights, cache_dt
         cache = cache.unsqueeze(2)
     inputs["kv_cache"] = cache
     _forward(adapter, prepared, inputs)
-    passed = prepared.kernel.calls[-1]["kv_cache"]
+    passed = vendor.calls[-1]["kv_cache"]
     assert passed.shape == (2, BLOCK_SIZE, 1, cache.shape[-1])
     assert passed.dtype == (torch.bfloat16 if cache_dtype == torch.bfloat16 else torch.float8_e4m3fn)
     assert _storage(passed) == _storage(cache)
@@ -361,22 +398,21 @@ def test_cache_views_alias_original_storage(adapter, prepared, weights, cache_dt
 
 
 @pytest.mark.parametrize("cache_quant", [False, True])
-def test_noncontiguous_cache_rejected_without_copy_or_launch(adapter, prepared, weights, cache_quant):
+def test_noncontiguous_cache_rejected_without_copy_or_launch(adapter, prepared, weights, cache_quant, vendor):
     inputs = _inputs(weights, cache_quant=cache_quant)
     cache = inputs["kv_cache"]
     inputs["kv_cache"] = torch.zeros((*cache.shape[:-1], cache.shape[-1] * 2), dtype=cache.dtype)[..., ::2]
     assert not inputs["kv_cache"].is_contiguous()
     with pytest.raises((ValueError, TypeError), match="(?i)contiguous"):
         _forward(adapter, prepared, inputs)
-    assert not prepared.kernel.calls
+    assert not vendor.calls
 
 
-def test_unequal_norm_epsilons_rejected_at_prepare(adapter, weights):
+def test_unequal_norm_epsilons_rejected_at_prepare(adapter, weights, vendor):
     weights["rmsnorm_epsilon_ckv"] = EPSILON * 2
-    kernel = PublicKernel()
     with pytest.raises(ValueError, match="(?i)eps"):
-        adapter.prepare_mla_prolog(**weights, quant_mla_prolog=kernel)
-    assert not kernel.calls
+        adapter.prepare_mla_prolog(**weights)
+    assert not vendor.calls
 
 
 @pytest.mark.parametrize(
@@ -393,12 +429,12 @@ def test_unequal_norm_epsilons_rejected_at_prepare(adapter, weights):
         {"unknown_option": True},
     ],
 )
-def test_unsupported_combinations_do_not_launch(adapter, prepared, weights, change):
+def test_unsupported_combinations_do_not_launch(adapter, prepared, weights, change, vendor):
     inputs = _inputs(weights)
     inputs.update(change)
     with pytest.raises((ValueError, TypeError, NotImplementedError)):
         _forward(adapter, prepared, inputs)
-    assert not prepared.kernel.calls
+    assert not vendor.calls
 
 
 @pytest.mark.parametrize(
@@ -410,12 +446,12 @@ def test_unsupported_combinations_do_not_launch(adapter, prepared, weights, chan
         {"k_nope_clip_alpha": 0.9},
     ],
 )
-def test_unsupported_fp8_cache_modes_do_not_launch(adapter, prepared, weights, change):
+def test_unsupported_fp8_cache_modes_do_not_launch(adapter, prepared, weights, change, vendor):
     inputs = _inputs(weights, cache_quant=True)
     inputs.update(change)
     with pytest.raises((ValueError, TypeError, NotImplementedError)):
         _forward(adapter, prepared, inputs)
-    assert not prepared.kernel.calls
+    assert not vendor.calls
 
 
 @pytest.mark.parametrize(
@@ -430,16 +466,15 @@ def test_unsupported_fp8_cache_modes_do_not_launch(adapter, prepared, weights, c
         "weight_uk",
     ],
 )
-def test_invalid_loaded_weight_shape_rejected(adapter, weights, name):
+def test_invalid_loaded_weight_shape_rejected(adapter, weights, name, vendor):
     weights[name] = weights[name][:-1]
-    kernel = PublicKernel()
     with pytest.raises((ValueError, TypeError)):
-        adapter.prepare_mla_prolog(**weights, quant_mla_prolog=kernel)
-    assert not kernel.calls
+        adapter.prepare_mla_prolog(**weights)
+    assert not vendor.calls
 
 
 @pytest.mark.parametrize("name", ["token_x", "dequant_scale_x", "cache_index", "kv_cache"])
-def test_invalid_forward_shape_does_not_launch(adapter, prepared, weights, name):
+def test_invalid_forward_shape_does_not_launch(adapter, prepared, weights, name, vendor):
     inputs = _inputs(weights)
     if name == "cache_index":
         inputs[name] = inputs[name][:-1]
@@ -447,7 +482,7 @@ def test_invalid_forward_shape_does_not_launch(adapter, prepared, weights, name)
         inputs[name] = inputs[name][..., :-1].contiguous()
     with pytest.raises((ValueError, TypeError)):
         _forward(adapter, prepared, inputs)
-    assert not prepared.kernel.calls
+    assert not vendor.calls
 
 
 def test_unknown_backend_is_not_silently_fallback(adapter):
@@ -457,14 +492,14 @@ def test_unknown_backend_is_not_silently_fallback(adapter):
     kernel.assert_not_called()
 
 
-def test_unit_clip_scalar_is_supported(adapter, prepared, weights):
+def test_unit_clip_scalar_is_supported(adapter, prepared, weights, vendor):
     inputs = _inputs(weights, cache_quant=True)
     inputs["k_nope_clip_alpha"] = 1.0
     assert len(_forward(adapter, prepared, inputs)) == 5
-    assert len(prepared.kernel.calls) == 1
+    assert len(vendor.calls) == 1
 
 
-def test_tensor_clip_rejected_without_host_scalar_read(adapter, prepared, weights, monkeypatch):
+def test_tensor_clip_rejected_without_host_scalar_read(adapter, prepared, weights, monkeypatch, vendor):
     inputs = _inputs(weights, cache_quant=True)
     inputs["k_nope_clip_alpha"] = torch.ones(1)
     forbidden = Mock(side_effect=AssertionError("must not synchronize tensor to host"))
@@ -472,10 +507,10 @@ def test_tensor_clip_rejected_without_host_scalar_read(adapter, prepared, weight
     with pytest.raises(ValueError, match="(?i)clip|tensor"):
         _forward(adapter, prepared, inputs)
     forbidden.assert_not_called()
-    assert not prepared.kernel.calls
+    assert not vendor.calls
 
 
-def test_repeated_forward_never_repacks(adapter, prepared, weights, npu, monkeypatch):
+def test_repeated_forward_never_repacks(adapter, prepared, weights, npu, monkeypatch, vendor):
     inputs = _inputs(weights)
     before = npu.npu_format_cast.call_count
     forbidden = Mock(side_effect=AssertionError("forward must not prepare weights"))
@@ -484,7 +519,7 @@ def test_repeated_forward_never_repacks(adapter, prepared, weights, npu, monkeyp
     _forward(adapter, prepared, inputs)
     assert npu.npu_format_cast.call_count == before
     forbidden.assert_not_called()
-    first, second = prepared.kernel.calls
+    first, second = vendor.calls
     for name in (
         "wqa",
         "wqb",
@@ -496,4 +531,8 @@ def test_repeated_forward_never_repacks(adapter, prepared, weights, npu, monkeyp
         "norm_weight_qa",
         "norm_weight_kva",
     ):
-        assert first[name] is second[name]
+        # Dispatcher scales are fresh byte/E8M0 views, never repacked buffers.
+        assert first[name].untyped_storage().data_ptr() == second[name].untyped_storage().data_ptr()
+        assert first[name].storage_offset() == second[name].storage_offset()
+        assert first[name].shape == second[name].shape
+        assert first[name].dtype == second[name].dtype

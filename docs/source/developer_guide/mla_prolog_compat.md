@@ -1,72 +1,156 @@
-# Experimental MLA Prolog compatibility adapter
+# Packaged A5 NoPE MLA Prolog
 
-This is an opt-in integration candidate, not a validated GLM deployment or a performance claim. The default `torch_npu` backend preserves existing SFA routing, including native preprocessing for NoPE. The optional `cannbot` backend maps the A5 DSL operator to the same five-output boundary. No model or runner is duplicated.
+GLM5.3-Flash NoPE MLA Prolog follows the A5 DeepSeek V4.1 packaging pattern:
+device-adaptor selection, a Torch schema, fake outputs, PrivateUse1 dispatch and
+a cached lazy external import. The scope differs: GLM fuses preprocessing and
+writes KV cache; DeepSeek's packaged indexer/attention consumes prepared caches.
+This is framework integration, **not a validated NPU deployment or speedup claim**.
 
-## Enabling the experimental path
+## Artifact installation: pending
 
-Install the matched CANNBotDSL and operator wheels in a compatible Linux x86_64 Python 3.12 NPU environment. The reviewed operator distribution is `cannbot-arena-net==0.3.0`, with dependency `cannbot-dsl>=0.7.0,<0.8`; its build metadata records DSL 0.7.1 and CANN 9.2.0-beta.2. The distribution version alone does not identify the artifact: the reviewed quantized wheel has SHA256 `c585750272eb8fc1e9e07bc8e3d68a790951c73e518b0cb1173e800dfcdf0d06`. Confirm the actual runtime and matching DSL wheel with the operator provider. This change does not install or vendor either package.
+Target: **Linux aarch64 / Python 3.12 (cp312), A5**. Matching operator and
+CANNBotDSL wheels are internal artifacts and cannot currently be exported.
+Installation is deferred: this change does not invent a URL, rename an x86 wheel,
+install a substitute, or change existing DeepSeek Docker dependencies. The old
+DeepSeek wheel does not establish that the GLM entry is present. Before deployment,
+obtain both matching aarch64 wheels and record actual filenames, SHA256 values,
+CANN/torch_npu compatibility and AOT specializations.
 
-With an otherwise working GLM5.3-Flash MXFP8 configuration, the experimental selection is:
+The earlier reviewed **x86** quantized distribution was
+`cannbot-arena-net==0.3.0` with `cannbot-dsl>=0.7.0,<0.8`; its metadata recorded
+DSL 0.7.1 / CANN 9.2.0-beta.2. These are interface research provenance, **not an
+ARM64 version lock or artifact hash**. Confirm that the supplied ARM64 wheel
+exposes the same public `ops.quant_mla_prolog.quant_mla_prolog` signature and
+capture-aware behavior. A matching package version alone is insufficient.
 
-```bash
-export VLLM_ASCEND_MLA_PROLOG_BACKEND=cannbot
-vllm serve /path/to/GLM-5.3-Flash-w8a8-mxfp8 \
-    --enforce-eager \
-    --kv-cache-dtype fp8 \
-    --tensor-parallel-size <your-validated-TP-size>
-```
+## Automatic selection
 
-Retain the other model-specific arguments from your known-working deployment. This is a configuration example, not a tested serving command. Do not enable speculative decoding, context/sequence parallelism, PD, sparse KV offload, or RL weight reloads with this initial adapter. For BF16 main cache validation, omit the FP8 cache setting and keep the original BF16 cache configuration.
+The base device adaptor returns torch_npu; the A5 adaptor selects Cannbot for
+NoPE layers with MXFP8 fused QKV projection. There is no environment-variable
+opt-in. RoPE layers, non-A5 devices and BF16/INT8 NoPE projections retain their
+previous route. Once selected, incompatible shapes, projection methods and
+cache/parallel settings fail before execution. A missing wheel fails at first
+real invocation; it never silently retries native preprocessing. Preparation and
+fake tracing do not load the vendor compiler.
 
-Unset the variable, or set it to `torch_npu`, to restore the default. The variable is not sensitive. The opt-in applies only to NoPE layers; existing RoPE layers keep the torch_npu backend. Unsupported explicit selections fail rather than silently reverting after cache mutation.
-
-## Supported interface envelope
-
-| Property | Initial boundary |
+| Property | Boundary |
 | --- | --- |
-| Hardware | A5 FP8-optimized profile; the wheel itself targets `dav-3510` |
-| Execution | Eager only; `--enforce-eager` required |
-| Activations | BF16 before the existing dynamic MXFP8 input quantization |
-| Projection and Indexer methods | Exact MXFP8 method, group size 32, scale algorithm 0; no bias or TP input padding |
-| Dimensions | NoPE `(Dn,Dr)=(256,0)`, KV rank 512; hidden size 1024..8192 aligned to 256; Q rank 640/1024/1536/2048; local heads 1..128 |
+| Hardware/artifact | A5 FP8-optimized profile; Linux aarch64, CPython 3.12 |
+| Execution integration | Eager prefill and full-graph decode; NPU validation pending |
+| Activations | BF16 before existing dynamic MXFP8 input quantization |
+| Projection / Indexer | MXFP8, group size 32, scale algorithm 0; no bias or TP input padding |
+| Dimensions | NoPE (Dn,Dr)=(256,0), KV rank 512; hidden size 1024..8192 aligned to 256; Q rank 640/1024/1536/2048; local heads 1..128 |
 | Normalization | Equal Q/KV epsilon; independent FP32 gamma snapshots |
-| Main cache | Contiguous PA_BSND BF16, or experimental packed FP8 E4M3 C8 with 128-element groups and 528-byte slots |
-| Page size | 16..1024, aligned to 16, subject to the existing attention backend requirements |
-| Query output | BF16; no full-Q quantization or HiF8 path |
-| Query norm output | E4M3 values plus per-token/per-32 E8M0 scales for the existing MXFP8 Indexer projection |
+| Main cache | Contiguous PA_BSND BF16, or FP8 E4M3 C8 with 128-element groups and 528-byte slots |
+| Page size | 16..1024, aligned to 16, subject to attention backend constraints |
+| Query / query norm | BF16 query; E4M3 normalized query plus per-token/per-32 E8M0 scales |
 
-Shape admission is not evidence that the wheel contains an AOT specialization for the model. Verify native specialization availability and any JIT behavior on the target machine before treating the configuration as deployable. INT8 C8, TurboQuant, different epsilon values and unsupported shapes are rejected.
+RL weight reloads, PD/KV transfer, speculative decoding, context/sequence
+parallelism, sparse KV offload, INT8 C8 and TurboQuant remain outside this
+integration's validated interface scope. They are not universally forbidden by
+DSL; they require separate state/cache/routing validation. No full-Q quantization
+or HiF8 path is introduced. Shape admission does not prove AOT kernel coverage.
 
-## Integration design
+## Dispatcher and cache contract
 
-The [central operator adapter](../../../vllm_ascend/ops/mla_prolog.py) owns optional imports, preparation, dispatch, cache views and output normalization. Its default backend forwards to `torch_npu.npu_mla_prolog_v3`. Cannbot calls only the public `ops.quant_mla_prolog.quant_mla_prolog`; it does not bypass validation through a private graph/native entry.
+[packaged_mla_prolog.py](../../../vllm_ascend/ops/packaged_mla_prolog.py) defines
+`vllm_ascend::quant_mla_prolog`. Prepared weights/scales/gammas are explicit tensor
+arguments; no Python callable or layer state is captured in the schema. Its four
+outputs follow the vendor convention. MX scales cross the dispatcher as zero-copy
+uint8 views, converted to E8M0 inside the NPU implementation and after return.
+This avoids reintroducing the vendor's documented E8M0 functionalization issue at
+the outer boundary. Fake outputs match the byte-carrier contract and support
+symbolic token counts without loading DSL.
 
-The [shared SFA implementation](../../../vllm_ascend/attention/sfa_v1.py) retains the existing preprocessing lifecycle, raw hidden-state input to the Indexer, connector/cache-write ordering and downstream attention. Preparation converts loaded `(in,out)` weights and `(in/64,out,2)` scales into independent ND `(out,in)` weights and `(out,in/64,2)` E8M0 scales. Original projection parameters remain intact. The prepared snapshots increase resident memory and are not refreshed by RL reloads, which are consequently rejected. No weight transpose or repack is performed per token.
+**KV cache is declared `Tensor(a!)`.** The original cache crosses the mutable
+boundary. Backend rank/dtype views preserve storage and offsets; noncontiguous
+or non-ND cache is rejected, never copied. Functionalization that would clone
+and copy back persistent cache is explicitly rejected. Failures after launch
+propagate; there is no native retry on potentially modified cache.
 
-The adapter returns `(query, query_rope, query_scale, query_norm, query_norm_scale)`. `query_rope` has explicit shape `[T,N,0]`; Cannbot `qr` is the normalized low-rank Query, not RoPE Query. The [KPool Indexer](../../../vllm_ascend/attention/indexer_kpool.py) can slice and forward an E4M3/E8M0 tuple to its existing MXFP8 linear method without re-quantization. Its tensor-input behavior is unchanged.
+The [central adapter](../../../vllm_ascend/ops/mla_prolog.py) retains preparation
+and the canonical five outputs:
+`(query, query_rope, query_scale, query_norm, query_norm_scale)`.
+Cannbot `qr` is normalized low-rank Query, not RoPE Query; the adapter supplies
+empty BF16 `[T,N,0]` RoPE output. The [KPool Indexer](../../../vllm_ascend/attention/indexer_kpool.py)
+consumes E4M3/E8M0 tuples without re-quantization. Loaded weights/scales are
+transposed into independent ND snapshots once; original parameters are unchanged.
+Extra resident memory and reload limitations remain.
 
-Cache adaptation uses storage-preserving views, including byte reinterpretation for packed FP8. A noncontiguous cache is rejected, never silently copied. Failure after a kernel launch is propagated: the adapter does not run native preprocessing again on a potentially modified cache.
+## Graph integration is not hardware qualification
 
-## Validation and limitations
+The reviewed public vendor entry detects NPU stream capture and selects its
+internal graph operator. Only its ordinary checked eager branch reads indices
+back to CPU. Consequently there is **no blanket enforce-eager gate** and no
+private/native vendor call. The public API is used in eager and capture execution.
+Ordinary compiled execution outside capture may still take the checked branch;
+no host-sync-free claim is made.
 
-The new CPU tests use real CPU torch tensors and mocked operator/NPU calls:
+The existing [MLA boundary](../../../vllm_ascend/ops/mla.py) already calls
+`torch.ops.vllm.mla_forward`; its fake implementation does not enter SFA, and
+its runtime implementation resolves persistent cache from the forward context
+before calling SFA. The packaged Prolog executes inside that opaque boundary.
+Platform configuration also lists `vllm::mla_forward` among attention split ops.
+This preserves the existing model/runner graph structure without duplicating it
+or adding an inert model flag. Ordinary compilation around this opaque attention
+boundary is distinct from directly functionalizing the packaged cache-writing op;
+only the latter is explicitly rejected. Do not infer a blanket ban on piecewise
+model compilation from that guard. Fake registration alone does not establish
+ACLGraph correctness or prove the absence of every cache-copy transformation.
+
+Before graph deployment, warm required specializations outside capture and
+verify the **actual ARM64 public API** is capture-aware. Every nonnegative slot
+must be in range and unique on **each invocation and replay**; negative padding
+slots are ignored. The scheduler/slot-mapping producer owns those invariants,
+as for native cache writes. One warmup check does not validate changed replay
+slots. Never add CPU slot checks inside capture or bypass the public API to make
+an incompatible wheel appear graph-capable.
+
+## Validation
+
+CPU contract tests (from the repository root):
 
 ```bash
-python -m pytest -q --confcutdir=tests/ut/ops tests/ut/ops/test_mla_prolog_adapter.py
+python -m pytest -q --confcutdir=tests/ut/ops tests/ut/ops/test_mla_prolog_adapter.py tests/ut/ops/test_packaged_mla_prolog.py
 python -m pytest -q --confcutdir=tests/ut/attention tests/ut/attention/test_mla_prolog_compat.py
 ```
 
-The isolated configuration deliberately avoids unrelated parent test fixtures. The SFA/KPool tests execute extracted production methods with injected dependencies; they do not import the complete vLLM runtime. These tests establish interface, routing and alias contracts only, not true NPU format behavior, vendor execution or numerical correctness. Run the normal repository UT/CI environment as well before merge.
+These use real CPU/meta/fake tensors and test-only CPU dispatch registrations.
+They cover mutation schema, lazy imports, symbolic outputs, byte reinterpretation,
+cache aliasing, failure propagation and a torch.compile backend=eager side-effect
+smoke test. SFA/KPool tests extract actual methods with mocked framework
+dependencies; they do not import the full vLLM runtime. CPU tests are not actual
+vendor execution, aarch64/cp312 validation or NPU numerical evidence. Run normal
+repository UT/CI in the supported environment before merge as well.
 
-Outstanding hardware checks:
+Local validation on Windows x86_64 / Python 3.14.7 / Torch 2.14.0+cpu:
+78 operator/dispatcher tests and 68 SFA/KPool/opaque-boundary tests passed. This
+host test environment deliberately does not stand in for the deployment target
+(aarch64/Python 3.12) or its pinned Torch/CANN stack. Ruff and whitespace checks
+were run on changed files; full repository pre-commit/NPU CI was not run.
 
-1. Verify the exact wheel, DSL, CANN, torch/torch_npu, vLLM and vllm-ascend revisions, actual weight/scale layouts and AOT coverage.
-2. Compare native versus fused Query, dequantized query-norm, cache payload and embedded FP32 scales. Agree tolerances before interpreting the results.
-3. Check GLM KPool top-k selection, model logits and representative dataset accuracy, including shared-index layers and page/sequence boundaries.
-4. Exercise repeated eager calls with new inputs and slots; verify the original cache storage is updated, including padding slots.
-5. Measure memory and performance separately. Independent prepared weights use additional memory, and the vendor checked eager entry currently reads cache indices back to the CPU. No speedup is claimed.
-6. Validate torch.compile and ACLGraph capture/replay with mutable-cache semantics separately before relaxing the eager-only gate. A vendor graph entry is not proof of vLLM graph compatibility.
+Deferred internal A5 checks:
 
-The fused FP32 projection/RMSNorm and cache quantization do not have identical rounding stages to the native BF16 chain. A matching 528-byte cache layout does not establish numerical equivalence.
+1. Record exact aarch64/cp312 wheel hashes and runtime revisions; verify public
+   capture dispatch and AOT/JIT warmup coverage.
+2. Compare native vs fused query, dequantized query-norm, cache bytes and embedded
+   FP32 scales; agree tolerances, then check KPool top-k, logits and model accuracy.
+3. Capture/replay with changing inputs **and slots**, page boundaries, negative
+   padding, both cache modes and query-norm enabled/disabled. Verify original
+   cache identity, untouched slots and absence of stale warmup indices.
+4. Verify no CPU index readback in capture, no persistent-cache clone/copy-back,
+   and correct eager prefill/full-graph decode routing in the real model runner.
+5. Measure extra prepared-weight memory and performance separately. FP32 fused
+   versus native BF16 rounding differs; matching cache layout does not establish
+   numerical equivalence or speedup.
 
-Before opening an upstream PR, add a numbered release-note fragment per the repository policy. Suggested text: "Added an experimental, opt-in A5 MXFP8 NoPE MLA Prolog compatibility adapter with a shared SFA entry point; hardware correctness and performance validation is required before deployment." No PR number is assigned by this branch-only change.
+## Release-note draft
+
+No PR number is assigned. Before opening a PR, place these entries in a numbered
+fragment following the repository release-note policy:
+
+- Config: A5 NoPE MXFP8 MLA Prolog selects packaged CANNBot operators through the
+  device adaptor rather than an environment opt-in.
+- Feature: Added lazy dispatcher/fake contracts with explicit KV-cache mutation
+  and eager/full-graph routing. Matching Linux aarch64/Python 3.12 artifacts and
+  hardware qualification remain required before deployment.

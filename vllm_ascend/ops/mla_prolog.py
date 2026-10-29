@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Central MLA Prolog V3 boundary, with an opt-in checked Cannbot adapter.
+"""Central MLA Prolog V3 boundary with a packaged A5 Cannbot adapter.
 
 The default backend forwards the CANN contract unchanged. Cannbot accepts only
 already-quantized MXFP8 input, NoPE D=256/K=512 and BF16 query output. Its public
-Python API is used deliberately; graph/native dispatch is not selected here.
-The caller owns capability/eager-mode gates and the lifetime of prepared weights.
+Python API owns eager/capture dispatch behind a mutable Torch operator.
+The caller owns capability gates and the lifetime of prepared weights.
 Recreate the prepared object after any weight reload; it is an independent snapshot.
 """
 
@@ -33,7 +33,7 @@ MAX_CACHE_BLOCK_SIZE = 1024
 
 @dataclass(frozen=True)
 class PreparedMlaProlog:
-    """Owned ND buffers and the public operator, prepared once per loaded layer."""
+    """Owned ND buffers, prepared once per loaded layer; no captured callable."""
 
     wqa: torch.Tensor
     wqb: torch.Tensor
@@ -48,7 +48,6 @@ class PreparedMlaProlog:
     hidden_size: int
     q_lora_rank: int
     num_heads: int
-    kernel: Callable[..., Any]
 
 
 def _require(condition: bool, message: str) -> None:
@@ -94,18 +93,6 @@ def _owned_nd(value: torch.Tensor, dtype: torch.dtype | None = None) -> torch.Te
     return result
 
 
-def _load_quant_mla_prolog() -> Callable[..., Any]:
-    # Optional package: importing this module/default dispatch must not load it.
-    try:
-        from ops.quant_mla_prolog import quant_mla_prolog
-    except ImportError as exc:
-        raise ImportError(
-            "The cannbot MLA backend requires the compatible cannbot_arena_net "
-            "wheel exposing ops.quant_mla_prolog.quant_mla_prolog"
-        ) from exc
-    return quant_mla_prolog
-
-
 def prepare_mla_prolog(
     *,
     weight_dq: torch.Tensor,
@@ -119,15 +106,14 @@ def prepare_mla_prolog(
     rmsnorm_gamma_ckv: torch.Tensor,
     rmsnorm_epsilon_cq: float,
     rmsnorm_epsilon_ckv: float,
-    quant_mla_prolog: Callable[..., Any] | None = None,
 ) -> PreparedMlaProlog:
     """Snapshot loaded (in,out) weights and (in/64,out,2) MX scales.
 
     Noncontiguous slices of fused weights/scales are supported. Scale carriers
     are reinterpreted, never numerically cast. Gamma is copied to FP32; the
     absorption weight must already be BF16. No original parameter is modified.
-    Resolving the optional public callable here makes missing packages fail at
-    layer initialization rather than during a cache-writing forward.
+    The optional operator package is resolved lazily by the NPU dispatcher, not
+    during preparation or fake tracing.
     """
     _require(isinstance(weight_dq, torch.Tensor) and weight_dq.ndim == 2, "weight_dq must have loaded (in,out) shape")
     hidden_size, q_rank = weight_dq.shape
@@ -160,9 +146,6 @@ def prepare_mla_prolog(
     ):
         _tensor(name, gamma, (width,), (torch.bfloat16, torch.float32), device)
     eps = _epsilon(rmsnorm_epsilon_cq, rmsnorm_epsilon_ckv)
-    kernel = quant_mla_prolog if quant_mla_prolog is not None else _load_quant_mla_prolog()
-    if not callable(kernel):
-        raise TypeError("quant_mla_prolog must be callable")
     wqa, wqb, wkva = (_owned_nd(weight.transpose(0, 1)) for weight in weights)
     ds_wqa, ds_wqb, ds_wkva = (_owned_nd(scale.transpose(0, 1)).view(torch.float8_e8m0fnu) for scale in scales)
     return PreparedMlaProlog(
@@ -179,11 +162,10 @@ def prepare_mla_prolog(
         hidden_size,
         q_rank,
         heads,
-        kernel,
     )
 
 
-def _cache_view(cache: torch.Tensor, mode: int, device: torch.device) -> torch.Tensor:
+def _validate_cache(cache: torch.Tensor, mode: int, device: torch.device) -> None:
     _require(
         isinstance(cache, torch.Tensor) and cache.ndim in (3, 4),
         "kv_cache must have (blocks,block_size[,1],width) shape",
@@ -199,19 +181,13 @@ def _cache_view(cache: torch.Tensor, mode: int, device: torch.device) -> torch.T
     shape = (blocks, block_size, width) if cache.ndim == 3 else (blocks, block_size, 1, width)
     dtypes = (torch.bfloat16,) if mode == 0 else (torch.float8_e4m3fn, torch.uint8, torch.int8)
     _tensor("kv_cache", cache, shape, dtypes, device, contiguous=True)
-    if device.type in ("npu", "privateuseone"):
-        import torch_npu
-
-        _require(torch_npu.get_npu_format(cache) in (0, 2), "kv_cache must use linear ND storage")
-    # Never use reshape/contiguous here: the kernel must update original storage.
-    view = cache.view(blocks, block_size, 1, width)
-    return view if mode == 0 else view.view(torch.float8_e4m3fn)
+    # ND-format validation and storage-preserving views belong inside the
+    # mutable dispatcher boundary, not in tracing of the canonical wrapper.
 
 
 def _cannbot_forward(
     *,
     prepared: PreparedMlaProlog,
-    kernel: Callable[..., Any],
     token_x: torch.Tensor,
     dequant_scale_x: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -313,7 +289,8 @@ def _cannbot_forward(
         contiguous=True,
     )
     _tensor("cache_index", cache_index, (tokens,), (torch.int64,), device, contiguous=True)
-    cache = _cache_view(kv_cache, kv_cache_quant_mode, device)
+    # Validate now, but pass the ORIGINAL cache through the mutable dispatcher.
+    _validate_cache(kv_cache, kv_cache_quant_mode, device)
     q_shape = (tokens, prepared.num_heads, KV_LORA_RANK)
     qr_shape = (tokens, prepared.q_lora_rank) if query_norm_flag else (0,)
     ds_shape = (tokens, prepared.q_lora_rank // MX_GROUP_SIZE) if query_norm_flag else (0,)
@@ -326,32 +303,27 @@ def _cannbot_forward(
             torch.empty(qr_shape, dtype=torch.float8_e4m3fn, device=device),
             torch.empty(ds_shape, dtype=torch.float8_e8m0fnu, device=device),
         )
-    q, descale_q, qr, descale_qr = kernel(
-        x=token_x,
-        wqa=prepared.wqa,
-        wqb=prepared.wqb,
-        wkva=prepared.wkva,
-        wkb=prepared.wkb,
-        descale_x=dequant_scale_x.view(torch.float8_e8m0fnu),
-        descale_wqa=prepared.descale_wqa,
-        descale_wqb=prepared.descale_wqb,
-        descale_wkva=prepared.descale_wkva,
-        norm_weight_qa=prepared.norm_weight_qa,
-        norm_weight_kva=prepared.norm_weight_kva,
-        kv_cache=cache,
-        cache_index=cache_index,
-        quant_scale_kv=None,
-        rope_sin=None,
-        rope_cos=None,
+    from vllm_ascend.ops.packaged_mla_prolog import quant_mla_prolog
+
+    q, descale_q, qr, descale_qr_bytes = quant_mla_prolog(
+        token_x,
+        prepared.wqa,
+        prepared.wqb,
+        prepared.wkva,
+        prepared.wkb,
+        dequant_scale_x.view(torch.uint8),
+        prepared.descale_wqa.view(torch.uint8),
+        prepared.descale_wqb.view(torch.uint8),
+        prepared.descale_wkva.view(torch.uint8),
+        prepared.norm_weight_qa,
+        prepared.norm_weight_kva,
+        kv_cache,
+        cache_index,
         norm_eps=prepared.norm_eps,
-        w_qr_quant_mode=1,
-        qkv_quant_mode=0 if kv_cache_quant_mode == 0 else 1,
-        cache_mode=0,
-        qr_scale=qc_qr_scale,
-        kvr_scale=kc_scale,
-        rope_mode=0,
+        kv_cache_quant_mode=kv_cache_quant_mode,
         return_qr=query_norm_flag,
     )
+    descale_qr = descale_qr_bytes.view(torch.float8_e8m0fnu)
     _tensor("query output", q, q_shape, (torch.bfloat16,), device)
     _tensor("query scale output", descale_q, (0,), (torch.float32,), device)
     _tensor("query norm output", qr, qr_shape, (torch.float8_e4m3fn,), device)
@@ -363,15 +335,14 @@ def mla_prolog(
     *,
     backend: str = "torch_npu",
     prepared: PreparedMlaProlog | None = None,
-    quant_mla_prolog: Callable[..., Any] | None = None,
     torch_npu_prolog: Callable[..., Any] | None = None,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dispatch canonical CANN kwargs and preserve the public five outputs.
 
-    Dependency injection is per call/object; there is no global mutable registry.
+    Cannbot execution always crosses the packaged Torch dispatcher boundary.
     The default branch intentionally does not apply Cannbot restrictions or
-    normalize outputs. The caller selects the backend from centralized envs.
+    normalize outputs. The caller selects the backend from the device adaptor.
     """
     if backend == "torch_npu":
         if torch_npu_prolog is None:
@@ -381,7 +352,4 @@ def mla_prolog(
         return torch_npu_prolog(**kwargs)
     _require(backend == "cannbot", f"Unsupported MLA Prolog backend: {backend}")
     _require(isinstance(prepared, PreparedMlaProlog), "Cannbot requires prepare_mla_prolog first")
-    kernel = quant_mla_prolog if quant_mla_prolog is not None else prepared.kernel
-    if not callable(kernel):
-        raise TypeError("quant_mla_prolog must be callable")
-    return _cannbot_forward(prepared=prepared, kernel=kernel, **kwargs)
+    return _cannbot_forward(prepared=prepared, **kwargs)

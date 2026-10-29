@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU integration contracts extracted from the actual SFA/Indexer source.
 
-This deliberately compiles selected AST methods, not either complete production
-module: vLLM, NPU kernels and their import-time registrations are not exercised.
+This compiles selected AST methods, not complete attention modules. The opaque
+MLA boundary test uses the real packaged dispatcher with test-only CPU kernels;
+vLLM runner integration and NPU execution are not exercised.
 Run with --confcutdir=tests/ut/attention to bypass global NPU fixtures.
 """
 
 import ast
+import importlib.util
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -18,6 +21,8 @@ import torch
 ROOT = Path(__file__).resolve().parents[3]
 SFA_PATH = ROOT / "vllm_ascend/attention/sfa_v1.py"
 INDEXER_PATH = ROOT / "vllm_ascend/attention/indexer_kpool.py"
+DEVICE_PATH = ROOT / "vllm_ascend/device/device_op.py"
+MLA_PATH = ROOT / "vllm_ascend/ops/mla.py"
 HIDDEN_SIZE = 1024
 Q_LORA_RANK = 640
 KV_LORA_RANK = 512
@@ -160,7 +165,9 @@ def routing():
     profile = SimpleNamespace(device_adaptor_family=family.FP8_OPTIMIZED)
     ascend = SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(enabled=False))
     cp = Mock(return_value=False)
+    device_operator = _extract_class(DEVICE_PATH, "A5DeviceAdaptor", ["get_mla_prolog_backend"], {})
     names = [
+        "_select_mla_prolog_backend",
         "_uses_cannbot_prolog",
         "_cannbot_config_unsupported_reasons",
         "_get_layer_quant_method",
@@ -177,6 +184,7 @@ def routing():
             _quant_globals(),
             PreprocessType=pp,
             DeviceAdaptorFamily=family,
+            DeviceOperator=device_operator,
             get_current_hardware_profile=lambda: profile,
             get_ascend_config=lambda: ascend,
             enable_dsa_cp=cp,
@@ -207,35 +215,212 @@ def routing():
     impl.enable_mlapo = False
     impl._process_weights_for_fused_prolog_v3 = Mock()
     impl._process_weights_for_fused_mlapo = Mock()
-    return SimpleNamespace(impl=impl, pp=pp, profile=profile, ascend=ascend, cp=cp)
+    impl._mla_prolog_backend = impl._select_mla_prolog_backend()
+    return SimpleNamespace(impl=impl, pp=pp, profile=profile, ascend=ascend, cp=cp, device_operator=device_operator)
 
 
-def test_default_nope_remains_native(routing):
+@pytest.mark.parametrize("method", [None, DynamicMethod(), StaticMethod()])
+def test_a5_nope_non_mxfp8_remains_native(routing, method):
     impl = routing.impl
-    del impl._mla_prolog_backend
+    impl.fused_qkv_a_proj.quant_method.quant_method = method
+    impl._mla_prolog_backend = impl._select_mla_prolog_backend()
+    assert impl._mla_prolog_backend == "torch_npu"
     assert not impl._uses_cannbot_prolog()
     assert impl._resolve_preprocess_type(torch.bfloat16) is routing.pp.NATIVE
     impl._process_weights_for_fused_prolog_v3.assert_not_called()
 
 
-def test_explicit_nope_eager_a5_mxfp8_selects_prolog(routing):
+def test_non_a5_nope_mxfp8_remains_native(routing, monkeypatch):
+    base = _extract_class(DEVICE_PATH, "BaseDeviceAdaptor", ["get_mla_prolog_backend"], {})
+    monkeypatch.setattr(routing.device_operator, "get_mla_prolog_backend", base.get_mla_prolog_backend)
     impl = routing.impl
+    impl._mla_prolog_backend = impl._select_mla_prolog_backend()
+    assert impl._mla_prolog_backend == "torch_npu"
+    assert impl._resolve_preprocess_type(torch.bfloat16) is routing.pp.NATIVE
+    impl._process_weights_for_fused_prolog_v3.assert_not_called()
+
+
+@pytest.mark.parametrize("enforce_eager", [False, True])
+def test_default_nope_a5_mxfp8_selects_prolog(routing, enforce_eager):
+    impl = routing.impl
+    impl.vllm_config.model_config.enforce_eager = enforce_eager
     assert impl._cannbot_config_unsupported_reasons() == []
     assert impl._resolve_preprocess_type(torch.bfloat16) is routing.pp.PROLOG_V3
     impl._process_weights_for_fused_prolog_v3.assert_called_once_with()
     impl._process_weights_for_fused_mlapo.assert_not_called()
 
 
-def test_rope_never_selects_cannbot(routing):
-    routing.impl.qk_rope_head_dim = 64
-    assert not routing.impl._uses_cannbot_prolog()
+@pytest.mark.parametrize("method", [None, DynamicMethod(), Mxfp8Method()])
+def test_rope_never_selects_cannbot(routing, method):
+    impl = routing.impl
+    impl.qk_rope_head_dim = 64
+    impl.fused_qkv_a_proj.quant_method.quant_method = method
+    impl._mla_prolog_backend = impl._select_mla_prolog_backend()
+    assert impl._mla_prolog_backend == "torch_npu"
+    assert not impl._uses_cannbot_prolog()
+    expected = routing.pp.NATIVE if method is None else routing.pp.PROLOG_V3
+    assert impl._resolve_preprocess_type(torch.bfloat16) is expected
+
+
+def test_constructor_uses_device_routing_without_environment_override():
+    tree = ast.parse(SFA_PATH.read_text(encoding="utf-8"))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AscendSFAImpl")
+    init = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "__init__")
+    assignments = [
+        node
+        for node in ast.walk(init)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Attribute) and target.attr == "_mla_prolog_backend" for target in node.targets)
+    ]
+    assert len(assignments) == 1
+    assert ast.unparse(assignments[0].value) == "self._select_mla_prolog_backend()"
+
+
+def test_existing_mla_boundary_hides_runtime_cache_from_fake_tracing():
+    tree = ast.parse(MLA_PATH.read_text(encoding="utf-8"))
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in ("mla_forward", "mla_forward_fake")
+    ]
+    registrations = [
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and ast.unparse(node.value.func) == "direct_register_custom_op"
+    ]
+    assert len(registrations) == 1
+    registration = {kw.arg: ast.unparse(kw.value) for kw in registrations[0].keywords}
+    assert registration == dict(
+        op_name="'mla_forward'",
+        op_func="mla_forward",
+        mutates_args="['output']",
+        fake_impl="mla_forward_fake",
+        dispatch_key="'PrivateUse1'",
+    )
+    cache = torch.zeros(4)
+    metadata = object()
+    backend = Mock()
+    layer = SimpleNamespace(mla_attn=SimpleNamespace(layer_name="attention", kv_cache=cache, impl=backend))
+    context = SimpleNamespace(no_compile_layers={"layer": layer}, attn_metadata={"attention": metadata})
+    namespace = dict(torch=torch, get_forward_context=lambda: context, eager_break_during_capture=lambda fn: fn)
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *functions],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), str(MLA_PATH), "exec"), namespace)
+    hidden, output = torch.ones(4), torch.empty(4)
+    namespace["mla_forward_fake"](hidden, output, "layer")
+    backend.forward.assert_not_called()
+    namespace["mla_forward"](hidden, output, "layer")
+    backend.forward.assert_called_once_with("attention", hidden, cache, metadata, output)
+
+
+def test_aot_opaque_mla_runtime_preserves_nested_packaged_cache():
+    # Real packaged schema/Functionalize guard and extracted MLA runtime, but
+    # test-only CPU kernels and registration: not an NPU or runner graph test.
+    name = "vllm_ascend.ops.packaged_mla_prolog"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, ROOT / "vllm_ascend/ops/packaged_mla_prolog.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    packaged = sys.modules[name]
+    cache = torch.zeros((1, 16, KV_LORA_RANK), dtype=torch.bfloat16)
+    pointer = cache.untyped_storage().data_ptr()
+    calls = []
+
+    def cpu_prolog(*args, **kwargs):
+        names = [arg.name for arg in packaged.quant_mla_prolog._schema.arguments]
+        values = dict(zip(names, args), **kwargs)
+        target = values["kv_cache"]
+        calls.append(target.untyped_storage().data_ptr())
+        target.add_(1)
+        return packaged._quant_mla_prolog_fake(**values)
+
+    def backend_forward(layer_name, hidden, original_cache, metadata, output):
+        unused = torch.empty(0, dtype=torch.uint8)
+        packaged.quant_mla_prolog(
+            hidden,
+            unused,
+            unused,
+            unused,
+            torch.empty((NUM_HEADS, 256, KV_LORA_RANK)),
+            unused,
+            unused,
+            unused,
+            unused,
+            torch.empty(Q_LORA_RANK),
+            torch.empty(KV_LORA_RANK),
+            original_cache,
+            torch.arange(hidden.shape[0]),
+            norm_eps=1e-6,
+        )
+        output.copy_(hidden + original_cache[0, 0, 0])
+
+    layer = SimpleNamespace(
+        mla_attn=SimpleNamespace(layer_name="attention", kv_cache=cache, impl=SimpleNamespace(forward=backend_forward))
+    )
+    context = SimpleNamespace(no_compile_layers={"layer": layer}, attn_metadata=None)
+    tree = ast.parse(MLA_PATH.read_text(encoding="utf-8"))
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in ("mla_forward", "mla_forward_fake")
+    ]
+    namespace = dict(torch=torch, get_forward_context=lambda: context, eager_break_during_capture=lambda fn: fn)
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *functions],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), str(MLA_PATH), "exec"), namespace)
+    cpu = torch.library.Library("vllm_ascend", "IMPL", "CPU")
+    outer = torch.library.Library("glm_mla_boundary_test", "DEF")
+    try:
+        cpu.impl("quant_mla_prolog", cpu_prolog)
+        outer.define("forward(Tensor hidden_states, Tensor(a!) output, str layer_name) -> ()")
+        outer.impl("forward", namespace["mla_forward"], "CPU")
+        torch.library.register_fake("glm_mla_boundary_test::forward", namespace["mla_forward_fake"], lib=outer)
+
+        def forward(hidden):
+            output = torch.empty_like(hidden)
+            torch.ops.glm_mla_boundary_test.forward(hidden, output, "layer")
+            return output
+
+        compiled = torch.compile(forward, backend="aot_eager", fullgraph=True)
+        hidden = torch.ones((3, HIDDEN_SIZE), dtype=torch.bfloat16)
+        torch.testing.assert_close(compiled(hidden), hidden + 1)
+        torch.testing.assert_close(compiled(hidden), hidden + 2)
+    finally:
+        outer._destroy()
+        cpu._destroy()
+    assert calls == [pointer, pointer]
+    assert torch.all(cache == 2)
+
+
+def test_model_wrapper_and_piecewise_split_keep_mla_opaque():
+    tree = ast.parse(MLA_PATH.read_text(encoding="utf-8"))
+    cls = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AscendMultiHeadLatentAttention"
+    )
+    forward = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "forward")
+    calls = [ast.unparse(node.func) for node in ast.walk(forward) if isinstance(node, ast.Call)]
+    assert "torch.ops.vllm.mla_forward" in calls
+    assert not any("impl" in call for call in calls)
+    platform = ast.parse((ROOT / "vllm_ascend/platform.py").read_text(encoding="utf-8"))
+    splits = [
+        node
+        for node in ast.walk(platform)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "compilation_config.splitting_ops.extend"
+    ]
+    assert any("vllm::mla_forward" in ast.literal_eval(node.args[0]) for node in splits)
 
 
 @pytest.mark.parametrize(
     "case,reason",
     [
         ("hardware", "A5"),
-        ("graph", "eager"),
         ("rl", "RL"),
         ("pd", "PD"),
         ("speculative", "speculative"),
@@ -252,8 +437,6 @@ def test_unsupported_configuration_fails_without_prepare(routing, case, reason):
     config = impl.vllm_config
     if case == "hardware":
         routing.profile.device_adaptor_family = object()
-    elif case == "graph":
-        config.model_config.enforce_eager = False
     elif case == "rl":
         impl.rl_weight_update_enabled = True
     elif case == "pd":

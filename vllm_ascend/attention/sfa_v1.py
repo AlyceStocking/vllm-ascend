@@ -21,7 +21,6 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.utils import select_common_block_size
 
-from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -917,11 +916,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.enable_mlapo = bool(get_ascend_config().enable_mlapo)
 
         self.enable_sp = enable_sp()
-        backend = envs.VLLM_ASCEND_MLA_PROLOG_BACKEND
-        if backend not in ("torch_npu", "cannbot"):
-            raise ValueError(f"Invalid VLLM_ASCEND_MLA_PROLOG_BACKEND: {backend!r}")
-        # The opt-in applies only to NoPE; existing RoPE deployments are unchanged.
-        self._mla_prolog_backend = backend if self.qk_rope_head_dim == 0 else "torch_npu"
+        self._mla_prolog_backend = self._select_mla_prolog_backend()
         self._mla_prolog_prepared: PreparedMlaProlog | None = None
         if self._mla_prolog_backend == "cannbot":
             reasons = self._cannbot_config_unsupported_reasons()
@@ -1028,17 +1023,24 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.has_indexer:
             self.indexer.process_weights_after_loading()
 
+    def _select_mla_prolog_backend(self) -> str:
+        # The packaged ABI supports NoPE MXFP8, not every A5 SFA model.
+        # Preserve native NoPE preprocessing for BF16/INT8 and the existing
+        # torch_npu fused path for RoPE, regardless of the device provider.
+        quant_method = self._get_layer_quant_method(self.fused_qkv_a_proj)
+        if self.qk_rope_head_dim != 0 or type(quant_method) is not AscendW8A8MXFP8DynamicLinearMethod:
+            return "torch_npu"
+        return DeviceOperator.get_mla_prolog_backend()
+
     def _uses_cannbot_prolog(self) -> bool:
         return getattr(self, "_mla_prolog_backend", "torch_npu") == "cannbot" and self.qk_rope_head_dim == 0
 
     def _cannbot_config_unsupported_reasons(self) -> list[str]:
-        """Conservative opt-in boundary; no device reads or cache mutations."""
+        """Validate the selected packaged ABI without device reads or mutations."""
         reasons = []
         if get_current_hardware_profile().device_adaptor_family != DeviceAdaptorFamily.FP8_OPTIMIZED:
             reasons.append("requires A5 FP8 hardware")
         config = self.vllm_config
-        if not config.model_config.enforce_eager:
-            reasons.append("requires --enforce-eager; graph execution is not validated")
         if self.rl_weight_update_enabled:
             reasons.append("does not support RL weight reloads")
         if config.kv_transfer_config is not None:
@@ -1085,8 +1087,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             rmsnorm_epsilon_ckv=self.kv_a_layernorm.variance_epsilon,
         )
         logger.warning_once(
-            "Experimental Cannbot MLA Prolog selected: eager only; NPU correctness "
-            "and performance must be validated for this wheel/model combination."
+            "Cannbot MLA Prolog selected for A5 NoPE MXFP8: the public package "
+            "dispatches eager and full-graph execution inside the opaque MLA boundary. "
+            "Direct functionalization of Prolog is unsupported because KV cache updates must remain in place. "
+            "NPU correctness and performance require validation for this wheel/model combination."
         )
 
     @staticmethod
