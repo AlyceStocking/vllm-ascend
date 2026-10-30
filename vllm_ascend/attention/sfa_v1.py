@@ -28,6 +28,7 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     get_pcp_num_replicated_tokens,
     is_pcp_decode_sharding_enabled,
 )
+from vllm_ascend.attention.indexer_kpool import Glm5NextKPoolIndexerBackend
 from vllm_ascend.attention.sparse_flash_mla import sparse_flash_mla, sparse_flash_mla_metadata
 from vllm_ascend.attention.utils import (
     MLAPO_MAX_SUPPORTED_TOKENS,
@@ -1158,6 +1159,12 @@ class AscendSFAImpl(MLAAttentionImpl):
     def _get_fused_type_unsupported_reasons(self, pp_type: PreprocessType) -> list[str]:
         reasons = []
         cannbot = self._uses_cannbot_prolog() and pp_type is PreprocessType.PROLOG_V3
+        bf16_indexer = (
+            cannbot
+            and self.has_indexer
+            and type(getattr(self.indexer, "impl", None)) is Glm5NextKPoolIndexerBackend
+            and Glm5NextKPoolIndexerBackend.supports_bf16_query_input(getattr(self.indexer, "wq_b", None))
+        )
         if self.qk_rope_head_dim == 0 and not cannbot:
             reasons.append("NoPE SFA currently uses native preprocessing; fused NoPE contracts are not enabled.")
         if cannbot:
@@ -1167,10 +1174,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                 projections.append(("indexer.wq_b", getattr(self.indexer, "wq_b", None)))
             for name, projection in projections:
                 method = self._get_layer_quant_method(projection)
-                if type(method) is not AscendW8A8MXFP8DynamicLinearMethod:
-                    reasons.append(f"Cannbot requires an MXFP8 {name}")
-                elif method.group_size != MX_GROUP_SIZE or method.dynamic_mx_quant_scale_alg != 0:
-                    reasons.append(f"Cannbot requires per-32 MXFP8 scale_alg=0 for {name}")
+                if type(method) is AscendW8A8MXFP8DynamicLinearMethod:
+                    if method.group_size != MX_GROUP_SIZE or method.dynamic_mx_quant_scale_alg != 0:
+                        reasons.append(f"Cannbot requires per-32 MXFP8 scale_alg=0 for {name}")
+                elif not (name == "indexer.wq_b" and bf16_indexer):
+                    reasons.append(f"Cannbot requires an MXFP8 {name} (or BF16 wq_b with the KPool input bridge)")
                 if getattr(projection, "bias", None) is not None:
                     reasons.append(f"Cannbot does not support {name} bias")
                 if any(getattr(projection, "mxfp8_tp_padding", (0, 0))):
@@ -1185,10 +1193,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         quant_method = self._get_layer_quant_method(self.fused_qkv_a_proj)
         qt = type(quant_method) if quant_method is not None else None
         if pp_type is PreprocessType.PROLOG_V3:
-            # Prolog's indexer query can carry quantization scales independently
-            # of the MLA weight type. Preserve the native query for an
-            # unquantized indexer, including layers that later toggle skip_topk.
-            if self.has_indexer:
+            # Only the CANNBot/KPool bridge decodes MX query tuples for BF16
+            # projections. Keep other PROLOG_V3 indexer contracts unchanged,
+            # including layers that later toggle skip_topk.
+            if self.has_indexer and not bf16_indexer:
                 wq_b = getattr(self.indexer, "wq_b", None)
                 if not hasattr(wq_b, "weight_scale"):
                     reasons.append("PROLOG_V3 requires a quantized indexer query projection.")

@@ -31,6 +31,7 @@ from vllm_ascend.core.kv_cache_interface import (
     get_storage_block_size,
 )
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_current_hardware_profile
+from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.mla_prolog import MX_GROUP_SIZE
 from vllm_ascend.quantization.methods import AscendW8A8MXFP8DynamicLinearMethod
 from vllm_ascend.utils import _round_up, enable_dsa_cp
@@ -647,14 +648,59 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
             raise TypeError(f"GLM KPool cache {layer.prefix!r} is not bound to a tensor.")
         return cache
 
+    @staticmethod
+    def supports_bf16_query_input(projection) -> bool:
+        # A missing inner quant_method also describes unknown wrappers; it is
+        # not evidence of an unquantized projection.
+        weight = getattr(projection, "weight", None)
+        return (
+            type(getattr(projection, "quant_method", None)) is AscendUnquantizedLinearMethod
+            and isinstance(weight, torch.Tensor)
+            and weight.dtype == torch.bfloat16
+        )
+
+    @staticmethod
+    def _dequantize_mxfp8_query(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+        """Decode E4M3 * per-32 E8M0 directly to BF16, round-to-nearest-even.
+
+        Integer byte operations avoid unsupported NPU float8 casts and flushing
+        the E8M0 minimum scale (2**-127) before multiplication. Normal products
+        are exact in BF16; only BF16 subnormals need rounding. No host reads,
+        new kernel dependency, or mutation of the producer tensors is needed.
+        """
+        tokens, width = values.shape
+        raw = values.view(torch.uint8).to(torch.int32).reshape(tokens, width // MX_GROUP_SIZE, MX_GROUP_SIZE)
+        scale = scales.view(torch.uint8).to(torch.int32).unsqueeze(-1)
+        exponent = (raw >> 3) & 0xF
+        mantissa = raw & 0x7
+        # Normalize the three-bit E4M3 subnormal significand (including zero).
+        leading = torch.where(mantissa >= 4, 2, torch.where(mantissa >= 2, 1, 0))
+        significand = torch.where(exponent == 0, mantissa << (7 - leading), (8 + mantissa) << 4)
+        # BF16/E8M0 both have bias 127; E4M3 has bias 7. Its subnormal
+        # value is mantissa * 2**-9. Combine exponents before rounding.
+        bf_exponent = torch.where(exponent == 0, leading + scale - 9, exponent + scale - 7)
+        shift = (1 - bf_exponent).clamp(min=1, max=10)
+        subnormal = (significand + (1 << (shift - 1)) - 1 + ((significand >> shift) & 1)) >> shift
+        bits = torch.where(bf_exponent <= 0, subnormal, (bf_exponent << 7) | (significand - 128))
+        bits = torch.where(bf_exponent >= 255, 0x7F80, bits)
+        magnitude = raw & 0x7F
+        bits = torch.where(magnitude == 0, 0, bits)
+        bits = torch.where((magnitude == 0x7F) | (scale == 255), 0x7FC0, bits)
+        # Signed int16 conversion stays in range, including negative zero.
+        signed_bits = bits - ((raw & 0x80) << 8)
+        return signed_bits.to(torch.int16).view(torch.bfloat16).reshape(tokens, width)
+
     def _get_query_input(
         self, q_c: torch.Tensor | tuple[torch.Tensor, torch.Tensor], num_tokens: int
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        bf16_projection = self.supports_bf16_query_input(self.wq_b)
         if not isinstance(q_c, tuple):
+            if bf16_projection and q_c.dtype == torch.float8_e4m3fn:
+                raise TypeError("GLM KPool FP8 q_c requires scales before BF16 query projection.")
             return q_c[:num_tokens]
         method = getattr(getattr(self.wq_b, "quant_method", None), "quant_method", None)
-        if type(method) is not AscendW8A8MXFP8DynamicLinearMethod:
-            raise TypeError("GLM KPool quantized q_c requires an MXFP8 query projection.")
+        if type(method) is not AscendW8A8MXFP8DynamicLinearMethod and not bf16_projection:
+            raise TypeError("GLM KPool quantized q_c requires an MXFP8 or unquantized BF16 query projection.")
         if any(getattr(self.wq_b, "mxfp8_tp_padding", (0, 0))):
             raise ValueError("GLM KPool quantized q_c does not support TP input padding.")
         if len(q_c) != 2:
@@ -662,12 +708,13 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         values, scales = q_c
         if not isinstance(values, torch.Tensor) or not isinstance(scales, torch.Tensor):
             raise TypeError("GLM KPool quantized q_c values and scales must be tensors.")
-        if method.group_size != MX_GROUP_SIZE:
+        if not bf16_projection and method.group_size != MX_GROUP_SIZE:
             raise ValueError("GLM KPool quantized q_c requires group size 32.")
         if values.dtype != torch.float8_e4m3fn or scales.dtype != torch.float8_e8m0fnu:
             raise TypeError("GLM KPool quantized q_c requires E4M3 values and E8M0 scales.")
         if (
-            values.ndim != 2
+            num_tokens < 0
+            or values.ndim != 2
             or values.shape[0] < num_tokens
             or values.shape[1] != self.q_lora_rank
             or values.shape[1] % MX_GROUP_SIZE
@@ -677,6 +724,10 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
             or values.device != scales.device
         ):
             raise ValueError("GLM KPool quantized q_c requires per-token, per-32 scales.")
+        if bf16_projection:
+            if values.device != self.wq_b.weight.device:
+                raise ValueError("GLM KPool q_c and BF16 query projection must share a device.")
+            return self._dequantize_mxfp8_query(values[:num_tokens], scales[:num_tokens])
         # The existing MXFP8 linear consumes this tuple without re-quantizing.
         return values[:num_tokens], scales[:num_tokens]
 

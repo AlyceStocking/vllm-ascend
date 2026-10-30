@@ -38,7 +38,8 @@ fake tracing do not load the vendor compiler.
 | Hardware/artifact | A5 FP8-optimized profile; Linux aarch64, CPython 3.12 |
 | Execution integration | Eager prefill and full-graph decode; NPU validation pending |
 | Activations | BF16 before existing dynamic MXFP8 input quantization |
-| Projection / Indexer | MXFP8, group size 32, scale algorithm 0; no bias or TP input padding |
+| Prolog projections | MXFP8, group size 32, scale algorithm 0; no bias or TP input padding |
+| KPool Indexer query projection | MXFP8 as above, or the unquantized Ascend linear method with BF16 weights; no bias or TP input padding |
 | Dimensions | NoPE (Dn,Dr)=(256,0), KV rank 512; hidden size 1024..8192 aligned to 256; Q rank 640/1024/1536/2048; local heads 1..128 |
 | Normalization | Equal Q/KV epsilon; independent FP32 gamma snapshots |
 | Main cache | Contiguous PA_BSND BF16, or FP8 E4M3 C8 with 128-element groups and 528-byte slots |
@@ -73,7 +74,20 @@ and the canonical five outputs:
 `(query, query_rope, query_scale, query_norm, query_norm_scale)`.
 Cannbot `qr` is normalized low-rank Query, not RoPE Query; the adapter supplies
 empty BF16 `[T,N,0]` RoPE output. The [KPool Indexer](../../../vllm_ascend/attention/indexer_kpool.py)
-consumes E4M3/E8M0 tuples without re-quantization. Loaded weights/scales are
+passes E4M3/E8M0 tuples directly to MXFP8 query projections. For an unquantized
+BF16 query projection, it decodes each value with its per-32 scale and rounds
+the product to BF16 (nearest-even) before calling the original projection.
+The bridge uses device-side integer byte operations, avoiding float8 casts,
+host readback and underflow of the minimum E8M0 scale. It does not modify
+weights, rerun RMSNorm or retry native Prolog. Only the KPool backend receives
+this eligibility exception; other PROLOG_V3 Indexers keep their existing guard.
+
+This reconstructs the **quantized** query norm, not its pre-quantization BF16
+value. Validate Indexer top-k and model accuracy as well as bridge latency and
+NPU graph replay. In MLA layers with Q LoRA, SFA `q_proj` refers to the model
+`q_b_proj`; it is separate from `indexer.wq_b`, which is not a Prolog input.
+
+Loaded weights/scales are
 transposed into independent ND snapshots once; original parameters are unchanged.
 Extra resident memory and reload limitations remain.
 
@@ -124,7 +138,9 @@ vendor execution, aarch64/cp312 validation or NPU numerical evidence. Run normal
 repository UT/CI in the supported environment before merge as well.
 
 Local validation on Windows x86_64 / Python 3.14.7 / Torch 2.14.0+cpu:
-78 operator/dispatcher tests and 68 SFA/KPool/opaque-boundary tests passed. This
+78 operator/dispatcher tests and 94 SFA/KPool/opaque-boundary tests passed,
+including all 65,536 E4M3/E8M0 byte pairs and changing-input CPU AOT execution
+of the BF16 Indexer bridge. This
 host test environment deliberately does not stand in for the deployment target
 (aarch64/Python 3.12) or its pinned Torch/CANN stack. Ruff and whitespace checks
 were run on changed files; full repository pre-commit/NPU CI was not run.
@@ -154,3 +170,6 @@ fragment following the repository release-note policy:
 - Feature: Added lazy dispatcher/fake contracts with explicit KV-cache mutation
   and eager/full-graph routing. Matching Linux aarch64/Python 3.12 artifacts and
   hardware qualification remain required before deployment.
+- Fix: Allow MXFP8 CANNBot Prolog with a BF16 KPool Indexer by decoding its
+  normalized Query input on device, without changing Indexer weights or falling
+  back to native Prolog. NPU numerical and performance validation remains pending.
