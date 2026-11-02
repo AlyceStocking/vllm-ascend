@@ -1036,6 +1036,18 @@ class AscendSFAImpl(MLAAttentionImpl):
     def _uses_cannbot_prolog(self) -> bool:
         return getattr(self, "_mla_prolog_backend", "torch_npu") == "cannbot" and self.qk_rope_head_dim == 0
 
+    def _runtime_preprocess_type(self, attn_metadata: M, num_input_tokens: int) -> PreprocessType:
+        """Diagnostic policy: packaged Prolog only for metadata-classified decode."""
+        fused_type = self.preprocess_type
+        if fused_type == PreprocessType.PROLOG_V3 and self._uses_cannbot_prolog():
+            # Decide before any cache-writing kernel. Mixed batches stay native
+            # as a whole; never retry native after a partially executed Prolog.
+            if attn_metadata.attn_state != AscendAttentionState.DecodeOnly or attn_metadata.num_prefills > 0:
+                return PreprocessType.NATIVE
+        if fused_type == PreprocessType.MLAPO and num_input_tokens > MLAPO_MAX_SUPPORTED_TOKENS:
+            return PreprocessType.NATIVE
+        return fused_type
+
     def _cannbot_config_unsupported_reasons(self) -> list[str]:
         """Validate the selected packaged ABI without device reads or mutations."""
         reasons = []
@@ -1088,8 +1100,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             rmsnorm_epsilon_ckv=self.kv_a_layernorm.variance_epsilon,
         )
         logger.warning_once(
-            "Cannbot MLA Prolog selected for A5 NoPE MXFP8: the public package "
-            "dispatches eager and full-graph execution inside the opaque MLA boundary. "
+            "Cannbot MLA Prolog diagnostic policy: metadata-classified decode only; "
+            "non-decode/prefill batches use native preprocessing. "
             "Direct functionalization of Prolog is unsupported because KV cache updates must remain in place. "
             "NPU correctness and performance require validation for this wheel/model combination."
         )
@@ -2066,11 +2078,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         actual_seq_lengths_query = parallel_context.actual_seq_lengths_query
         actual_seq_lengths_key = parallel_context.actual_seq_lengths_key
 
-        fused_type: PreprocessType = self.preprocess_type
-        # PROLOG_V3 serves every attention state (decode, spec decoding and
-        # prefill); only MLAPO carries a per-call token-count limit.
-        if self.preprocess_type == PreprocessType.MLAPO and num_input_tokens > MLAPO_MAX_SUPPORTED_TOKENS:
-            fused_type = PreprocessType.NATIVE
+        fused_type = self._runtime_preprocess_type(attn_metadata, num_input_tokens)
 
         # IMPORTANT!
         # NOTE: With PIECEWISE ACL graphs, this method is executed in

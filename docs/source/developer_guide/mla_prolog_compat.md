@@ -6,6 +6,35 @@ a cached lazy external import. The scope differs: GLM fuses preprocessing and
 writes KV cache; DeepSeek's packaged indexer/attention consumes prepared caches.
 This is framework integration, **not a validated NPU deployment or speedup claim**.
 
+## Diagnostic branch: native prefill, CANNBot decode
+
+`glm-cannbot-decode-only` is based on `5af1f31`. No new environment variable or
+serve argument is needed: retain the existing launch command, including
+`FULL_DECODE_ONLY`. For selected CANNBot NoPE layers, only metadata classified
+as `DecodeOnly` with `num_prefills == 0` uses Prolog. Prefill, cache-hit prefill,
+chunked/mixed and other non-decode states use the existing native chain for the
+whole batch. Other backends and the legacy MLAPO token limit are unchanged.
+
+This is a pre-execution route choice, not an exception fallback. Original
+projection/norm parameters and prepared CANNBot weights remain loaded, and both
+routes use the same KV cache. Native prefill therefore avoids the CANNBot public
+eager entry and the Prolog-output MXFP8-to-BF16 indexer bridge; decode retains
+that bridge where required. Weight memory is not restored to the all-native
+baseline. The public Prolog package is still required for decode.
+
+**Classification caveat:** MRV2 may classify prefix-cache-hit prefill with only
+one uncached token per request as `DecodeOnly`; if `num_prefills` is also zero,
+it retains Prolog, including inside graph replay. This branch follows attention
+metadata, not a new scheduler-level prefill flag. It does not change the runner
+or add device-to-host reads.
+
+Compare against `5af1f31` with identical workload, warmup, prefix-cache hit rate
+and graph settings. Check startup for `Cannbot MLA Prolog diagnostic policy`.
+The policy and CPU contracts do not establish NPU correctness or performance:
+validate native-prefill to Prolog-decode transitions, BF16/C8 cache consistency,
+mixed batches and padded graph decode on the target system before relying on
+the TTFT result.
+
 ## Artifact installation: pending
 
 Target: **Linux aarch64 / Python 3.12 (cp312), A5**. Matching operator and

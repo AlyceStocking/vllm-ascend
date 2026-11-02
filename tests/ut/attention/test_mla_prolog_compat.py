@@ -228,6 +228,81 @@ def routing():
     return SimpleNamespace(impl=impl, pp=pp, profile=profile, ascend=ascend, cp=cp, device_operator=device_operator)
 
 
+@pytest.mark.parametrize("tokens", [1, 128, 8192])
+@pytest.mark.parametrize(
+    "backend,rope,preprocess,state,prefills,expected",
+    [
+        ("cannbot", 0, "PROLOG_V3", "DecodeOnly", 0, "PROLOG_V3"),
+        ("cannbot", 0, "PROLOG_V3", "DecodeOnly", 1, "NATIVE"),
+        ("cannbot", 0, "PROLOG_V3", "PrefillNoCache", 1, "NATIVE"),
+        ("cannbot", 0, "PROLOG_V3", "PrefillCacheHit", 1, "NATIVE"),
+        ("cannbot", 0, "PROLOG_V3", "ChunkedPrefill", 1, "NATIVE"),
+        ("cannbot", 0, "PROLOG_V3", "ChunkedPrefill", 0, "NATIVE"),
+        ("cannbot", 0, "PROLOG_V3", "SpecDecoding", 0, "NATIVE"),
+        ("cannbot", 0, "NATIVE", "DecodeOnly", 0, "NATIVE"),
+        ("torch_npu", 0, "PROLOG_V3", "PrefillNoCache", 1, "PROLOG_V3"),
+        ("cannbot", 64, "PROLOG_V3", "PrefillNoCache", 1, "PROLOG_V3"),
+    ],
+)
+def test_cannbot_runtime_decode_only_policy(tokens, backend, rope, preprocess, state, prefills, expected):
+    pp = SimpleNamespace(NATIVE=object(), PROLOG_V3=object(), MLAPO=object())
+    states = SimpleNamespace(DecodeOnly="DecodeOnly")
+    cls = _extract_class(
+        SFA_PATH,
+        "AscendSFAImpl",
+        ["_runtime_preprocess_type", "_uses_cannbot_prolog"],
+        dict(PreprocessType=pp, AscendAttentionState=states, MLAPO_MAX_SUPPORTED_TOKENS=1024),
+    )
+    impl = cls()
+    impl.preprocess_type = getattr(pp, preprocess)
+    impl._mla_prolog_backend = backend
+    impl.qk_rope_head_dim = rope
+    prepared = impl._mla_prolog_prepared = object()
+    metadata = SimpleNamespace(attn_state=state, num_prefills=prefills)
+    assert impl._runtime_preprocess_type(metadata, tokens) is getattr(pp, expected)
+    # Routing must not invalidate prepared decode weights or persist a prefill fallback.
+    assert impl.preprocess_type is getattr(pp, preprocess)
+    assert impl._mla_prolog_prepared is prepared
+    if backend == "cannbot" and rope == 0 and preprocess == "PROLOG_V3":
+        metadata.attn_state, metadata.num_prefills = "DecodeOnly", 0
+        assert impl._runtime_preprocess_type(metadata, 128) is pp.PROLOG_V3
+
+
+@pytest.mark.parametrize("tokens", [1024, 1025])
+def test_decode_only_policy_preserves_legacy_mlapo_limit(tokens):
+    pp = SimpleNamespace(NATIVE=object(), PROLOG_V3=object(), MLAPO=object())
+    cls = _extract_class(
+        SFA_PATH,
+        "AscendSFAImpl",
+        ["_runtime_preprocess_type"],
+        dict(PreprocessType=pp, MLAPO_MAX_SUPPORTED_TOKENS=1024),
+    )
+    impl = cls()
+    impl.preprocess_type = pp.MLAPO
+    assert impl._runtime_preprocess_type(None, tokens) is (pp.MLAPO if tokens <= 1024 else pp.NATIVE)
+
+
+def test_forward_selects_runtime_policy_before_prolog_dispatch():
+    tree = ast.parse(SFA_PATH.read_text(encoding="utf-8"))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AscendSFAImpl")
+    forward = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "forward")
+    choices = [
+        node
+        for node in ast.walk(forward)
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "fused_type" for t in node.targets)
+    ]
+    assert len(choices) == 1
+    assert ast.unparse(choices[0].value) == "self._runtime_preprocess_type(attn_metadata, num_input_tokens)"
+    prolog_calls = [
+        node
+        for node in ast.walk(forward)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_sfa_preprocess_prolog_v3"
+    ]
+    assert prolog_calls and all(choices[0].lineno < call.lineno for call in prolog_calls)
+
+
 @pytest.mark.parametrize("method", [None, DynamicMethod(), StaticMethod()])
 def test_a5_nope_non_mxfp8_remains_native(routing, method):
     impl = routing.impl
