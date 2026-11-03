@@ -17,10 +17,11 @@ whole batch. Other backends and the legacy MLAPO token limit are unchanged.
 
 This is a pre-execution route choice, not an exception fallback. Original
 projection/norm parameters and prepared CANNBot weights remain loaded, and both
-routes use the same KV cache. Native prefill therefore avoids the CANNBot public
-eager entry and the Prolog-output MXFP8-to-BF16 indexer bridge; decode retains
-that bridge where required. Weight memory is not restored to the all-native
-baseline. The public Prolog package is still required for decode.
+routes use the same KV cache. Native prefill avoids the CANNBot entry entirely.
+Decode with a BF16 Indexer recomputes its query using the original A projection
+and RMSNorm; no Prolog-output MXFP8-to-BF16 converter remains. Weight memory is
+not restored to the all-native baseline. The public Prolog package is still
+required for decode.
 
 **Classification caveat:** MRV2 may classify prefix-cache-hit prefill with only
 one uncached token per request as `DecodeOnly`; if `num_prefills` is also zero,
@@ -28,8 +29,10 @@ it retains Prolog, including inside graph replay. This branch follows attention
 metadata, not a new scheduler-level prefill flag. It does not change the runner
 or add device-to-host reads.
 
-Compare against `5af1f31` with identical workload, warmup, prefix-cache hit rate
-and graph settings. Check startup for `Cannbot MLA Prolog diagnostic policy`.
+Compare against `da15e74` to isolate BF16 Indexer recomputation from the prior
+input-conversion implementation; both use the decode-only policy. Keep workload,
+warmup, prefix-cache hit rate and graph settings identical. Check startup for
+`Cannbot MLA Prolog diagnostic policy`.
 The policy and CPU contracts do not establish NPU correctness or performance:
 validate native-prefill to Prolog-decode transitions, BF16/C8 cache consistency,
 mixed batches and padded graph decode on the target system before relying on
@@ -73,7 +76,7 @@ fake tracing do not load the vendor compiler.
 | Normalization | Equal Q/KV epsilon; independent FP32 gamma snapshots |
 | Main cache | Contiguous PA_BSND BF16, or FP8 E4M3 C8 with 128-element groups and 528-byte slots |
 | Page size | 16..1024, aligned to 16, subject to attention backend constraints |
-| Query / query norm | BF16 query; E4M3 normalized query plus per-token/per-32 E8M0 scales |
+| Query / query norm | BF16 query; MXFP8 Indexer uses E4M3/E8M0 norm tuple; BF16 Indexer uses a natively recomputed BF16 norm |
 
 RL weight reloads, PD/KV transfer, speculative decoding, context/sequence
 parallelism, sparse KV offload, INT8 C8 and TurboQuant remain outside this
@@ -104,16 +107,24 @@ and the canonical five outputs:
 Cannbot `qr` is normalized low-rank Query, not RoPE Query; the adapter supplies
 empty BF16 `[T,N,0]` RoPE output. The [KPool Indexer](../../../vllm_ascend/attention/indexer_kpool.py)
 passes E4M3/E8M0 tuples directly to MXFP8 query projections. For an unquantized
-BF16 query projection, it decodes each value with its per-32 scale and rounds
-the product to BF16 (nearest-even) before calling the original projection.
-The bridge uses device-side integer byte operations, avoiding float8 casts,
-host readback and underflow of the minimum E8M0 scale. It does not modify
-weights, rerun RMSNorm or retry native Prolog. Only the KPool backend receives
-this eligibility exception; other PROLOG_V3 Indexers keep their existing guard.
+BF16 query projection, SFA disables Prolog query-norm output and recomputes
+`q_a_layernorm(fused_qkv_a_proj(hidden_states)[0][..., :q_lora_rank])`, following
+the native input path used by PR #20332. This keeps the original MXFP8 A
+projection and BF16 normalization semantics; it does not dequantize a Prolog
+output, change weights, or rerun any cache-writing operation. The earlier
+integer input converter is removed. Only CANNBot with a BF16 KPool Indexer
+receives this exception; other PROLOG_V3 contracts remain unchanged.
 
-This reconstructs the **quantized** query norm, not its pre-quantization BF16
-value. Validate Indexer top-k and model accuracy as well as bridge latency and
-NPU graph replay. In MLA layers with Q LoRA, SFA `q_proj` refers to the model
+Recomputation occurs only inside the selected decode Prolog path and when
+Indexer query work is needed. Physical-empty batches, disabled runtime Indexers,
+`skip_topk`, and zero-local-query batches skip it without disabling existing
+Indexer key/cache writes. FULL-graph padding is preserved, not trimmed to the
+actual-token count. Prefill/mixed batches already compute the native norm and
+never execute this extra path.
+
+The extra A projection and RMSNorm have real compute/memory costs; the source
+parameters remain resident. Validate top-k, logits, graph replay and end-to-end
+latency rather than assuming a speedup. In MLA layers with Q LoRA, SFA `q_proj` refers to the model
 `q_b_proj`; it is separate from `indexer.wq_b`, which is not a Prolog input.
 
 Loaded weights/scales are
@@ -167,9 +178,9 @@ vendor execution, aarch64/cp312 validation or NPU numerical evidence. Run normal
 repository UT/CI in the supported environment before merge as well.
 
 Local validation on Windows x86_64 / Python 3.14.7 / Torch 2.14.0+cpu:
-78 operator/dispatcher tests and 94 SFA/KPool/opaque-boundary tests passed,
-including all 65,536 E4M3/E8M0 byte pairs and changing-input CPU AOT execution
-of the BF16 Indexer bridge. This
+78 operator/dispatcher tests and 155 SFA/KPool/opaque-boundary tests passed,
+including native-prefill/mixed routing, BF16 query recomputation, unchanged
+MXFP8 tuples, source-weight preservation and skipped/empty/padded queries. This
 host test environment deliberately does not stand in for the deployment target
 (aarch64/Python 3.12) or its pinned Torch/CANN stack. Ruff and whitespace checks
 were run on changed files; full repository pre-commit/NPU CI was not run.
@@ -191,14 +202,15 @@ Deferred internal A5 checks:
 
 ## Release-note draft
 
-No PR number is assigned. Before opening a PR, place these entries in a numbered
-fragment following the repository release-note policy:
+Before opening an upstream PR, use its assigned number for the release-note
+fragment following the repository policy. Entries for this integration:
 
 - Config: A5 NoPE MXFP8 MLA Prolog selects packaged CANNBot operators through the
   device adaptor rather than an environment opt-in.
 - Feature: Added lazy dispatcher/fake contracts with explicit KV-cache mutation
   and eager/full-graph routing. Matching Linux aarch64/Python 3.12 artifacts and
   hardware qualification remain required before deployment.
-- Fix: Allow MXFP8 CANNBot Prolog with a BF16 KPool Indexer by decoding its
-  normalized Query input on device, without changing Indexer weights or falling
-  back to native Prolog. NPU numerical and performance validation remains pending.
+- Fix: Replace the BF16 KPool input converter with native A-projection and
+  RMSNorm recomputation during CANNBot decode, without changing Indexer weights
+  or retrying cache writes. Prefill/mixed batches remain native. NPU numerical
+  and performance validation remains pending.

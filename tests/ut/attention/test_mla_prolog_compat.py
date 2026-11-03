@@ -75,7 +75,8 @@ def _quant_globals():
 @pytest.mark.parametrize("tokens", [0, 3])
 @pytest.mark.parametrize("cache_quant", [False, True])
 @pytest.mark.parametrize("with_scale", [False, True])
-def test_shared_forward_nope_shapes_and_indexer_scales(tokens, cache_quant, with_scale):
+@pytest.mark.parametrize("indexer_mode", ["mx", "bf16", "skip_topk", "no_runtime", "zero_local"])
+def test_shared_forward_nope_shapes_and_indexer_scales(tokens, cache_quant, with_scale, indexer_mode):
     x_quant = torch.zeros((tokens, HIDDEN_SIZE), dtype=torch.uint8).view(torch.float8_e4m3fn)
     x_scale = torch.zeros((tokens, HIDDEN_SIZE // 32), dtype=torch.uint8)
     q_norm = torch.zeros((tokens, Q_LORA_RANK), dtype=torch.uint8).view(torch.float8_e4m3fn)
@@ -104,11 +105,25 @@ def test_shared_forward_nope_shapes_and_indexer_scales(tokens, cache_quant, with
     impl._mla_prolog_prepared = object()
     impl.enable_sparse_sfa_c8 = cache_quant
     impl.has_indexer = True
+    native_query = indexer_mode != "mx"
+    impl._uses_native_indexer_query = Mock(return_value=native_query)
+    impl.runtime_has_indexer = indexer_mode != "no_runtime"
+    impl.skip_topk = indexer_mode == "skip_topk"
+    actual_tokens = 0 if indexer_mode == "zero_local" else max(tokens - 1, 1)
+    metadata = SimpleNamespace(num_actual_tokens=actual_tokens)
     impl.local_num_heads = NUM_HEADS
     impl.qk_rope_head_dim = 0
     impl.kv_lora_rank = KV_LORA_RANK
     impl.q_lora_rank = Q_LORA_RANK
-    impl.q_a_layernorm = SimpleNamespace(weight=torch.ones(Q_LORA_RANK), variance_epsilon=1e-6)
+    impl.q_a_layernorm = Mock()
+    impl.q_a_layernorm.weight = torch.ones(Q_LORA_RANK, dtype=torch.bfloat16)
+    impl.q_a_layernorm.variance_epsilon = 1e-6
+    impl.q_a_layernorm.side_effect = lambda x: torch.nn.functional.rms_norm(
+        x, (Q_LORA_RANK,), impl.q_a_layernorm.weight, 1e-6
+    )
+    source_qkv = (torch.arange(tokens * (Q_LORA_RANK + KV_LORA_RANK)) % 31).to(torch.bfloat16)
+    source_qkv = source_qkv.reshape(tokens, Q_LORA_RANK + KV_LORA_RANK)
+    impl.fused_qkv_a_proj = Mock(return_value=(source_qkv,))
     impl.kv_a_layernorm = SimpleNamespace(weight=torch.ones(KV_LORA_RANK), variance_epsilon=1e-6)
     impl.sfa_qsfa_tile_size = 128
     impl.sfa_qsfa_k_nope_clip_alpha = None
@@ -121,12 +136,35 @@ def test_shared_forward_nope_shapes_and_indexer_scales(tokens, cache_quant, with
     cache = torch.empty((2, 16, 528 if cache_quant else 512), dtype=torch.uint8 if cache_quant else torch.bfloat16)
     slots = torch.arange(tokens, dtype=torch.int64)
     # A NoPE layer has no second (KR) cache; this catches accidental tuple indexing.
-    hidden_out, query, rope, latent = impl._sfa_preprocess_prolog_v3(hidden, (cache,), None, None, slots)
+    if native_query:
+        # Disabled query_norm has no payload, even for a nonempty decode batch.
+        adapter.return_value = (*adapter.return_value[:3], torch.empty(0), torch.empty(0))
+    hidden_out, query, rope, latent = impl._sfa_preprocess_prolog_v3(
+        hidden, (cache,), None, None, slots, attn_metadata=metadata
+    )
     assert hidden_out is hidden
     assert query.shape == (tokens, NUM_HEADS, KV_LORA_RANK)
     assert rope.shape == (tokens, NUM_HEADS, 0)
     # (0, Q/32) is a valid T0 MX scale tensor; only (0,) means absent.
-    if with_scale:
+    if native_query:
+        needs_query = tokens > 0 and indexer_mode == "bf16"
+        if needs_query:
+            impl.fused_qkv_a_proj.assert_called_once_with(hidden)
+            impl.q_a_layernorm.assert_called_once()
+            norm_input = impl.q_a_layernorm.call_args.args[0]
+            assert norm_input.shape == (tokens, Q_LORA_RANK)  # Keep FULL graph padding.
+            assert norm_input.untyped_storage().data_ptr() == source_qkv.untyped_storage().data_ptr()
+            expected = torch.nn.functional.rms_norm(
+                source_qkv[..., :Q_LORA_RANK], (Q_LORA_RANK,), impl.q_a_layernorm.weight, 1e-6
+            )
+            torch.testing.assert_close(latent, expected, rtol=0, atol=0)
+            assert latent.dtype == torch.bfloat16
+        else:
+            assert latent is None
+            impl.fused_qkv_a_proj.assert_not_called()
+            impl.q_a_layernorm.assert_not_called()
+    elif with_scale:
+        impl.fused_qkv_a_proj.assert_not_called()
         assert isinstance(latent, tuple) and len(latent) == 2
         assert latent[0].shape == (tokens, Q_LORA_RANK)
         assert latent[1].shape == (tokens, Q_LORA_RANK // 32)
@@ -140,6 +178,7 @@ def test_shared_forward_nope_shapes_and_indexer_scales(tokens, cache_quant, with
         npu.npu_dynamic_mx_quant.assert_not_called()
     adapter.assert_called_once()
     call = adapter.call_args.kwargs
+    assert call["query_norm_flag"] is (not native_query)
     assert call["backend"] == "cannbot"
     assert call["prepared"] is impl._mla_prolog_prepared
     if tokens:
@@ -182,6 +221,7 @@ def routing():
         "_resolve_preprocess_type",
         "_fused_preprocess_type",
         "_get_fused_type_unsupported_reasons",
+        "_uses_native_indexer_query",
         "_try_enable_type",
     ]
     cls = _extract_class(
@@ -577,7 +617,7 @@ def indexer():
     cls = _extract_class(
         INDEXER_PATH,
         "Glm5NextKPoolIndexerBackend",
-        ["_get_query_input", "supports_bf16_query_input", "_dequantize_mxfp8_query"],
+        ["_get_query_input", "supports_bf16_query_input"],
         _quant_globals(),
     )
     impl = cls()
@@ -739,81 +779,23 @@ def test_non_cannbot_prolog_still_rejects_bf16_indexer(routing):
 
 
 @pytest.mark.parametrize("tokens", [0, 1, 3, 5])
-def test_bf16_indexer_dequantizes_only_requested_tokens(indexer, tokens):
+def test_bf16_indexer_slices_native_query_without_conversion(indexer, tokens):
     indexer.wq_b = _bf16_projection()
-    # Distinct per-token/per-group scales catch wrong broadcasting or inversion.
-    raw = (torch.arange(5 * Q_LORA_RANK) % 127).to(torch.uint8).reshape(5, Q_LORA_RANK)
-    scale_bytes = ((torch.arange(5 * Q_LORA_RANK // 32) % 9) + 123).to(torch.uint8).reshape(5, -1)
-    values, scales = raw.view(torch.float8_e4m3fn), scale_bytes.view(torch.float8_e8m0fnu)
-    raw_before, scales_before = raw.clone(), scale_bytes.clone()
-    weight = indexer.wq_b.weight
-    weight_before = weight.clone()
-    result = indexer._get_query_input((values, scales), tokens)
-    expected = (values.float().reshape(5, Q_LORA_RANK // 32, 32) * scales.float().unsqueeze(-1)).reshape(5, -1)
-    torch.testing.assert_close(result, expected[:tokens].to(torch.bfloat16), rtol=0, atol=0)
-    assert result.shape == (tokens, Q_LORA_RANK) and result.is_contiguous()
-    assert result.device == values.device
-    torch.testing.assert_close(raw, raw_before)
-    torch.testing.assert_close(scale_bytes, scales_before)
-    assert indexer.wq_b.weight is weight
-    torch.testing.assert_close(weight, weight_before)
+    query = torch.randn((5, Q_LORA_RANK), dtype=torch.bfloat16)
+    result = indexer._get_query_input(query, tokens)
+    torch.testing.assert_close(result, query[:tokens], rtol=0, atol=0)
+    assert result.untyped_storage().data_ptr() == query.untyped_storage().data_ptr()
 
 
-def test_bf16_indexer_all_e4m3_e8m0_byte_pairs(indexer):
-    # Exhaust all 65,536 pairs, including E8 byte0, NaNs, signed zero,
-    # BF16 subnormal halfway ties, and overflow. Reference uses real CPU casts.
-    indexer.q_lora_rank = 256
-    indexer.wq_b = _bf16_projection(256)
-    raw = torch.arange(256, dtype=torch.uint8).expand(256, -1).contiguous()
-    scale_bytes = torch.arange(256, dtype=torch.uint8)[:, None].expand(-1, 8).contiguous()
-    values, scales = raw.view(torch.float8_e4m3fn), scale_bytes.view(torch.float8_e8m0fnu)
-    result = indexer._get_query_input((values, scales), 256)
-    expected = (values.float() * scales[:, :1].float()).to(torch.bfloat16)
-    torch.testing.assert_close(result, expected, rtol=0, atol=0, equal_nan=True)
-    valid = ~torch.isnan(expected)
-    assert torch.equal(result.view(torch.int16)[valid], expected.view(torch.int16)[valid])
-
-
-@pytest.mark.parametrize("case", ["missing_scales", "scale_shape", "scale_dtype", "device", "negative_tokens"])
-def test_bf16_indexer_rejects_invalid_query_contract(indexer, case):
+@pytest.mark.parametrize("query_type", ["tuple", "fp8", "fp16", "fp32"])
+def test_bf16_indexer_rejects_non_native_query(indexer, query_type):
     indexer.wq_b = _bf16_projection()
     values, scales = _query_tuple()
-    query, tokens = (values, scales), 3
-    if case == "missing_scales":
-        query = values
-    elif case == "scale_shape":
-        query = values, scales[:, :-1]
-    elif case == "scale_dtype":
-        query = values, scales.view(torch.uint8)
-    elif case == "device":
-        indexer.wq_b.weight = indexer.wq_b.weight.to("meta")
-    else:
-        tokens = -1
-    with pytest.raises((TypeError, ValueError)):
-        indexer._get_query_input(query, tokens)
-
-
-def test_bf16_indexer_empty_producer_tuple(indexer):
-    indexer.wq_b = _bf16_projection()
-    result = indexer._get_query_input(_query_tuple(tokens=0), 0)
-    assert result.shape == (0, Q_LORA_RANK) and result.dtype == torch.bfloat16
-
-
-def test_bf16_bridge_compiles_with_changed_inputs(indexer):
-    indexer.wq_b = _bf16_projection()
-
-    def bridge(raw, scale_bytes):
-        return indexer._get_query_input(
-            (raw.view(torch.float8_e4m3fn), scale_bytes.view(torch.float8_e8m0fnu)), raw.shape[0]
-        )
-
-    compiled = torch.compile(bridge, backend="aot_eager", fullgraph=True)
-    raw = torch.full((2, Q_LORA_RANK), 0x38, dtype=torch.uint8)  # E4M3 1.0
-    scales = torch.full((2, Q_LORA_RANK // 32), 127, dtype=torch.uint8)  # E8M0 1.0
-    torch.testing.assert_close(compiled(raw, scales), torch.ones(raw.shape, dtype=torch.bfloat16))
-    raw.fill_(0xC0)  # E4M3 -2.0
-    scales.fill_(128)  # E8M0 2.0
-    torch.testing.assert_close(compiled(raw, scales), torch.full(raw.shape, -4.0, dtype=torch.bfloat16))
+    query = (values, scales) if query_type == "tuple" else values
+    if query_type in ("fp16", "fp32"):
+        query = torch.zeros(values.shape, dtype=torch.float16 if query_type == "fp16" else torch.float32)
+    with pytest.raises(TypeError):
+        indexer._get_query_input(query, 3)
 
 
 @pytest.mark.parametrize("field,value", [("group_size", 64), ("dynamic_mx_quant_scale_alg", 1)])
@@ -875,7 +857,7 @@ def test_indexer_forward_passes_sliced_query_to_projection(compute_topk, bf16_in
     cls = _extract_class(
         INDEXER_PATH,
         "Glm5NextKPoolIndexerBackend",
-        ["_get_query_input", "supports_bf16_query_input", "_dequantize_mxfp8_query", "forward"],
+        ["_get_query_input", "supports_bf16_query_input", "forward"],
         dict(
             _quant_globals(),
             AscendIndexerKPoolMetadata=metadata_type,
@@ -905,7 +887,10 @@ def test_indexer_forward_passes_sliced_query_to_projection(compute_topk, bf16_in
     impl._forward_cann = Mock(return_value=object())
     values, scales = _query_tuple()
     hidden = torch.ones((5, HIDDEN_SIZE), dtype=torch.bfloat16)
-    result = impl.forward(hidden, (values, scales), hidden, metadata, compute_topk=compute_topk)
+    query = torch.ones((5, Q_LORA_RANK), dtype=torch.bfloat16) if bf16_indexer else (values, scales)
+    if bf16_indexer and not compute_topk:
+        query = None  # Key/cache update must not inspect an unused Query.
+    result = impl.forward(hidden, query, hidden, metadata, compute_topk=compute_topk)
     assert result is impl._forward_cann.return_value
     call = impl._forward_cann.call_args
     assert call.args[0].shape[0] == 3
@@ -913,12 +898,8 @@ def test_indexer_forward_passes_sliced_query_to_projection(compute_topk, bf16_in
         impl.wq_b.assert_called_once()
         passed_query = impl.wq_b.call_args.args[0]
         if bf16_indexer:
-            expected = (
-                (values[:3].float().reshape(3, Q_LORA_RANK // 32, 32) * scales[:3].float().unsqueeze(-1))
-                .reshape(3, Q_LORA_RANK)
-                .to(torch.bfloat16)
-            )
-            torch.testing.assert_close(passed_query, expected, rtol=0, atol=0, equal_nan=True)
+            torch.testing.assert_close(passed_query, query[:3], rtol=0, atol=0)
+            assert passed_query.untyped_storage().data_ptr() == query.untyped_storage().data_ptr()
         else:
             passed_values, passed_scales = passed_query
             assert passed_values.shape == (3, Q_LORA_RANK)
