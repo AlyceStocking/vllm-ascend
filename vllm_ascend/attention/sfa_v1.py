@@ -1036,6 +1036,28 @@ class AscendSFAImpl(MLAAttentionImpl):
     def _uses_cannbot_prolog(self) -> bool:
         return getattr(self, "_mla_prolog_backend", "torch_npu") == "cannbot" and self.qk_rope_head_dim == 0
 
+    def _uses_native_indexer_query(self) -> bool:
+        # The Indexer projection is not a Prolog weight. Keep its original
+        # BF16 input path instead of dequantizing Prolog's MXFP8 query norm.
+        return (
+            self._uses_cannbot_prolog()
+            and self.has_indexer
+            and type(getattr(self.indexer, "impl", None)) is Glm5NextKPoolIndexerBackend
+            and Glm5NextKPoolIndexerBackend.supports_bf16_query_input(getattr(self.indexer, "wq_b", None))
+        )
+
+    def _runtime_preprocess_type(self, attn_metadata: M, num_input_tokens: int) -> PreprocessType:
+        """Diagnostic policy: packaged Prolog only for metadata-classified decode."""
+        fused_type = self.preprocess_type
+        if fused_type == PreprocessType.PROLOG_V3 and self._uses_cannbot_prolog():
+            # Decide before any cache-writing kernel. Mixed batches stay native
+            # as a whole; never retry native after a partially executed Prolog.
+            if attn_metadata.attn_state != AscendAttentionState.DecodeOnly or attn_metadata.num_prefills > 0:
+                return PreprocessType.NATIVE
+        if fused_type == PreprocessType.MLAPO and num_input_tokens > MLAPO_MAX_SUPPORTED_TOKENS:
+            return PreprocessType.NATIVE
+        return fused_type
+
     def _cannbot_config_unsupported_reasons(self) -> list[str]:
         """Validate the selected packaged ABI without device reads or mutations."""
         reasons = []
@@ -1088,8 +1110,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             rmsnorm_epsilon_ckv=self.kv_a_layernorm.variance_epsilon,
         )
         logger.warning_once(
-            "Cannbot MLA Prolog selected for A5 NoPE MXFP8: the public package "
-            "dispatches eager and full-graph execution inside the opaque MLA boundary. "
+            "Cannbot MLA Prolog diagnostic policy: metadata-classified decode only; "
+            "non-decode/prefill batches use native preprocessing. "
             "Direct functionalization of Prolog is unsupported because KV cache updates must remain in place. "
             "NPU correctness and performance require validation for this wheel/model combination."
         )
@@ -1159,12 +1181,7 @@ class AscendSFAImpl(MLAAttentionImpl):
     def _get_fused_type_unsupported_reasons(self, pp_type: PreprocessType) -> list[str]:
         reasons = []
         cannbot = self._uses_cannbot_prolog() and pp_type is PreprocessType.PROLOG_V3
-        bf16_indexer = (
-            cannbot
-            and self.has_indexer
-            and type(getattr(self.indexer, "impl", None)) is Glm5NextKPoolIndexerBackend
-            and Glm5NextKPoolIndexerBackend.supports_bf16_query_input(getattr(self.indexer, "wq_b", None))
-        )
+        bf16_indexer = cannbot and self._uses_native_indexer_query()
         if self.qk_rope_head_dim == 0 and not cannbot:
             reasons.append("NoPE SFA currently uses native preprocessing; fused NoPE contracts are not enabled.")
         if cannbot:
@@ -1178,7 +1195,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     if method.group_size != MX_GROUP_SIZE or method.dynamic_mx_quant_scale_alg != 0:
                         reasons.append(f"Cannbot requires per-32 MXFP8 scale_alg=0 for {name}")
                 elif not (name == "indexer.wq_b" and bf16_indexer):
-                    reasons.append(f"Cannbot requires an MXFP8 {name} (or BF16 wq_b with the KPool input bridge)")
+                    reasons.append(
+                        f"Cannbot requires an MXFP8 {name} (or BF16 wq_b with native KPool query recomputation)"
+                    )
                 if getattr(projection, "bias", None) is not None:
                     reasons.append(f"Cannbot does not support {name} bias")
                 if any(getattr(projection, "mxfp8_tp_padding", (0, 0))):
@@ -1193,8 +1212,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         quant_method = self._get_layer_quant_method(self.fused_qkv_a_proj)
         qt = type(quant_method) if quant_method is not None else None
         if pp_type is PreprocessType.PROLOG_V3:
-            # Only the CANNBot/KPool bridge decodes MX query tuples for BF16
-            # projections. Keep other PROLOG_V3 indexer contracts unchanged,
+            # CANNBot/KPool recomputes the native query for BF16 projections.
+            # Keep other PROLOG_V3 indexer contracts unchanged,
             # including layers that later toggle skip_topk.
             if self.has_indexer and not bf16_indexer:
                 wq_b = getattr(self.indexer, "wq_b", None)
@@ -1522,6 +1541,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         qt = self._quant_type
         use_c8 = self.enable_sparse_sfa_c8
+        native_indexer_query = self._uses_native_indexer_query()
 
         common: dict[str, Any] = dict(
             weight_dq=self.weight_dq,
@@ -1532,7 +1552,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             rmsnorm_gamma_ckv=self.kv_a_layernorm.weight.data,
             rmsnorm_epsilon_cq=self.q_a_layernorm.variance_epsilon,
             rmsnorm_epsilon_ckv=self.kv_a_layernorm.variance_epsilon,
-            query_norm_flag=self.has_indexer,
+            query_norm_flag=self.has_indexer and not native_indexer_query,
             qc_qr_scale=1.0,
             kc_scale=1.0,
             cache_mode="PA_BSND",
@@ -1618,7 +1638,17 @@ class AscendSFAImpl(MLAAttentionImpl):
         ql_nope = ql_nope.view(num_tokens, num_h, self.kv_lora_rank)
         q_pe = q_pe.view(num_tokens, num_h, self.qk_rope_head_dim)
 
-        if self.has_indexer:
+        if native_indexer_query:
+            # Match the native BF16 Indexer input, not the already-quantized
+            # query norm. This does not rerun any cache-writing operation.
+            # MTP skip_topk can still need the Indexer key/cache path, but no Q.
+            has_local_query = attn_metadata is None or attn_metadata.num_actual_tokens > 0
+            if num_tokens and self.runtime_has_indexer and not self.skip_topk and has_local_query:
+                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+                q_c = self.q_a_layernorm(qkv_lora[..., : self.q_lora_rank])
+            else:
+                q_c = None
+        elif self.has_indexer:
             if q_c is None:
                 raise RuntimeError("npu_mla_prolog_v3 did not return query_norm for SFA indexer.")
             q_c = q_c.view(num_tokens, self.q_lora_rank)
@@ -2066,11 +2096,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         actual_seq_lengths_query = parallel_context.actual_seq_lengths_query
         actual_seq_lengths_key = parallel_context.actual_seq_lengths_key
 
-        fused_type: PreprocessType = self.preprocess_type
-        # PROLOG_V3 serves every attention state (decode, spec decoding and
-        # prefill); only MLAPO carries a per-call token-count limit.
-        if self.preprocess_type == PreprocessType.MLAPO and num_input_tokens > MLAPO_MAX_SUPPORTED_TOKENS:
-            fused_type = PreprocessType.NATIVE
+        fused_type = self._runtime_preprocess_type(attn_metadata, num_input_tokens)
 
         # IMPORTANT!
         # NOTE: With PIECEWISE ACL graphs, this method is executed in
