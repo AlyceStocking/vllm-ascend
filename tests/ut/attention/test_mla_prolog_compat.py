@@ -52,7 +52,11 @@ def _extract_class(path, class_name, names, namespace):
     source_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
     methods = [node for node in source_class.body if isinstance(node, ast.FunctionDef) and node.name in names]
     assert {node.name for node in methods} == set(names)
-    extracted = ast.ClassDef(name=class_name, bases=[], keywords=[], body=methods, decorator_list=[])
+    # Parsing supplies version-specific AST fields (e.g. type_params on 3.12+).
+    extracted = ast.parse("class Extracted: pass").body[0]
+    assert isinstance(extracted, ast.ClassDef)
+    extracted.name = class_name
+    extracted.body = [*methods]
     module = ast.Module(
         body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), extracted],
         type_ignores=[],
@@ -445,9 +449,10 @@ def test_aot_opaque_mla_runtime_preserves_nested_packaged_cache():
     name = "vllm_ascend.ops.packaged_mla_prolog"
     if name not in sys.modules:
         spec = importlib.util.spec_from_file_location(name, ROOT / "vllm_ascend/ops/packaged_mla_prolog.py")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
+        assert spec is not None and spec.loader is not None
+        packaged_module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = packaged_module
+        spec.loader.exec_module(packaged_module)
     packaged = sys.modules[name]
     cache = torch.zeros((1, 16, KV_LORA_RANK), dtype=torch.bfloat16)
     pointer = cache.untyped_storage().data_ptr()
@@ -682,7 +687,7 @@ def test_indexer_rejects_tuple_for_other_quantizers(indexer, method):
 )
 def test_indexer_rejects_malformed_tuple(indexer, case):
     values, scales = _query_tuple()
-    query = (values, scales)
+    query: tuple[object, ...] = (values, scales)
     tokens = 3
     if case == "padding":
         indexer.wq_b.mxfp8_tp_padding = (16, 0)

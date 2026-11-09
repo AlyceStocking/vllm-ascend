@@ -47,6 +47,7 @@ def packaged(monkeypatch):
     if name not in sys.modules:
         path = MODULE_PATH.with_name("packaged_mla_prolog.py")
         spec = importlib.util.spec_from_file_location(name, path)
+        assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
@@ -67,7 +68,7 @@ def packaged(monkeypatch):
 def vendor(monkeypatch, packaged):
     kernel = PublicKernel()
     public = ModuleType("ops.quant_mla_prolog")
-    public.quant_mla_prolog = kernel
+    monkeypatch.setattr(public, "quant_mla_prolog", kernel, raising=False)
     package = ModuleType("ops")
     package.__path__ = []
     monkeypatch.setitem(sys.modules, "ops", package)
@@ -78,8 +79,10 @@ def vendor(monkeypatch, packaged):
 @pytest.fixture
 def npu(monkeypatch):
     module = ModuleType("torch_npu")
-    module.npu_format_cast = Mock(side_effect=lambda tensor, fmt: tensor.clone())
-    module.npu_dynamic_mx_quant = Mock(side_effect=AssertionError("already quantized input"))
+    monkeypatch.setattr(module, "npu_format_cast", Mock(side_effect=lambda tensor, fmt: tensor.clone()), raising=False)
+    monkeypatch.setattr(
+        module, "npu_dynamic_mx_quant", Mock(side_effect=AssertionError("already quantized input")), raising=False
+    )
     monkeypatch.setitem(sys.modules, "torch_npu", module)
     return module
 
@@ -255,7 +258,7 @@ def test_missing_dependency_is_lazy_and_actionable(adapter, weights, monkeypatch
 def test_resolves_public_vendor_entrypoint(adapter, weights, monkeypatch):
     public = ModuleType("ops.quant_mla_prolog")
     kernel = PublicKernel()
-    public.quant_mla_prolog = kernel
+    monkeypatch.setattr(public, "quant_mla_prolog", kernel, raising=False)
     package = ModuleType("ops")
     package.__path__ = []
     monkeypatch.setitem(sys.modules, "ops", package)
