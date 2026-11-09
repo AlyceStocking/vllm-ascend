@@ -87,7 +87,7 @@ or HiF8 path is introduced. Shape admission does not prove AOT kernel coverage.
 
 ## Dispatcher and cache contract
 
-[packaged_mla_prolog.py](../../../vllm_ascend/ops/packaged_mla_prolog.py) defines
+[packaged_mla_prolog.py](https://github.com/vllm-project/vllm-ascend/blob/93e3048c969a9f216a4899adcffce2eb58b2db6f/vllm_ascend/ops/packaged_mla_prolog.py) defines
 `vllm_ascend::quant_mla_prolog`. Prepared weights/scales/gammas are explicit tensor
 arguments; no Python callable or layer state is captured in the schema. Its four
 outputs follow the vendor convention. MX scales cross the dispatcher as zero-copy
@@ -102,11 +102,11 @@ or non-ND cache is rejected, never copied. Functionalization that would clone
 and copy back persistent cache is explicitly rejected. Failures after launch
 propagate; there is no native retry on potentially modified cache.
 
-The [central adapter](../../../vllm_ascend/ops/mla_prolog.py) retains preparation
+The [central adapter](https://github.com/vllm-project/vllm-ascend/blob/93e3048c969a9f216a4899adcffce2eb58b2db6f/vllm_ascend/ops/mla_prolog.py) retains preparation
 and the canonical five outputs:
 `(query, query_rope, query_scale, query_norm, query_norm_scale)`.
 Cannbot `qr` is normalized low-rank Query, not RoPE Query; the adapter supplies
-empty BF16 `[T,N,0]` RoPE output. The [KPool Indexer](../../../vllm_ascend/attention/indexer_kpool.py)
+empty BF16 `[T,N,0]` RoPE output. The [KPool Indexer](https://github.com/vllm-project/vllm-ascend/blob/93e3048c969a9f216a4899adcffce2eb58b2db6f/vllm_ascend/attention/indexer_kpool.py)
 passes E4M3/E8M0 tuples directly to MXFP8 query projections. For an unquantized
 BF16 query projection, SFA disables Prolog query-norm output and recomputes
 `q_a_layernorm(fused_qkv_a_proj(hidden_states)[0][..., :q_lora_rank])`, following
@@ -141,7 +141,7 @@ private/native vendor call. The public API is used in eager and capture executio
 Ordinary compiled execution outside capture may still take the checked branch;
 no host-sync-free claim is made.
 
-The existing [MLA boundary](../../../vllm_ascend/ops/mla.py) already calls
+The existing [MLA boundary](https://github.com/vllm-project/vllm-ascend/blob/93e3048c969a9f216a4899adcffce2eb58b2db6f/vllm_ascend/ops/mla.py) already calls
 `torch.ops.vllm.mla_forward`; its fake implementation does not enter SFA, and
 its runtime implementation resolves persistent cache from the forward context
 before calling SFA. The packaged Prolog executes inside that opaque boundary.
@@ -217,7 +217,7 @@ hardware-review checklist:
 ## Release note
 
 [PR #21302](https://github.com/vllm-project/vllm-ascend/pull/21302) carries the
-[numbered release-note fragment](../../../release_notes/fragments/21302.yaml).
+[numbered release-note fragment](https://github.com/vllm-project/vllm-ascend/blob/93e3048c969a9f216a4899adcffce2eb58b2db6f/release_notes/fragments/21302.yaml).
 Scope of this integration:
 
 - Config: A5 NoPE MXFP8 MLA Prolog selects packaged CANNBot operators through the
