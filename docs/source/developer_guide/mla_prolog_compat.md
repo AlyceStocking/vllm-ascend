@@ -4,7 +4,8 @@ GLM5.3-Flash NoPE MLA Prolog follows the A5 DeepSeek V4.1 packaging pattern:
 device-adaptor selection, a Torch schema, fake outputs, PrivateUse1 dispatch and
 a cached lazy external import. The scope differs: GLM fuses preprocessing and
 writes KV cache; DeepSeek's packaged indexer/attention consumes prepared caches.
-This is framework integration, **not a validated NPU deployment or speedup claim**.
+This is framework integration, **not a quantified speedup claim**. Validation
+reports and evidence limitations are recorded below.
 
 ## Diagnostic branch: native prefill, CANNBot decode
 
@@ -68,7 +69,7 @@ fake tracing do not load the vendor compiler.
 | Property | Boundary |
 | --- | --- |
 | Hardware/artifact | A5 FP8-optimized profile; Linux aarch64, CPython 3.12 |
-| Execution integration | Eager prefill and full-graph decode; NPU validation pending |
+| Execution integration | Native prefill and Prolog decode; detailed hardware evidence not attached |
 | Activations | BF16 before existing dynamic MXFP8 input quantization |
 | Prolog projections | MXFP8, group size 32, scale algorithm 0; no bias or TP input padding |
 | KPool Indexer query projection | MXFP8 as above, or the unquantized Ascend linear method with BF16 weights; no bias or TP input padding |
@@ -185,7 +186,11 @@ host test environment deliberately does not stand in for the deployment target
 (aarch64/Python 3.12) or its pinned Torch/CANN stack. Ruff and whitespace checks
 were run on changed files; full repository pre-commit/NPU CI was not run.
 
-Deferred internal A5 checks:
+The author reported successful branch validation on 2026-11-09. Exact run
+commands/logs, graph-mode coverage, numerical results and performance numbers
+were not supplied with that confirmation. This report is separate from the
+local CPU tests above and does not establish every item in the following
+hardware-review checklist:
 
 1. Record exact aarch64/cp312 wheel hashes and runtime revisions; verify public
    capture dispatch and AOT/JIT warmup coverage.
@@ -200,10 +205,11 @@ Deferred internal A5 checks:
    versus native BF16 rounding differs; matching cache layout does not establish
    numerical equivalence or speedup.
 
-## Release-note draft
+## Release note
 
-Before opening an upstream PR, use its assigned number for the release-note
-fragment following the repository policy. Entries for this integration:
+[PR #21302](https://github.com/vllm-project/vllm-ascend/pull/21302) carries the
+[numbered release-note fragment](../../../release_notes/fragments/21302.yaml).
+Scope of this integration:
 
 - Config: A5 NoPE MXFP8 MLA Prolog selects packaged CANNBot operators through the
   device adaptor rather than an environment opt-in.
@@ -212,5 +218,5 @@ fragment following the repository policy. Entries for this integration:
   hardware qualification remain required before deployment.
 - Fix: Replace the BF16 KPool input converter with native A-projection and
   RMSNorm recomputation during CANNBot decode, without changing Indexer weights
-  or retrying cache writes. Prefill/mixed batches remain native. NPU numerical
-  and performance validation remains pending.
+  or retrying cache writes. Prefill/mixed batches remain native. Detailed
+  numerical and performance evidence is not attached to the author report.
