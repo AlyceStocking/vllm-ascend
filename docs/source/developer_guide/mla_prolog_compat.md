@@ -179,14 +179,23 @@ vendor execution, aarch64/cp312 validation or NPU numerical evidence. Run normal
 repository UT/CI in the supported environment before merge as well.
 
 Local validation on Windows x86_64 / Python 3.14.7 / Torch 2.14.0+cpu:
-78 operator/dispatcher tests and 155 SFA/KPool/opaque-boundary tests passed,
+78 operator/dispatcher tests and 286 SFA/KPool/opaque-boundary tests passed,
 including native-prefill/mixed routing, BF16 query recomputation, unchanged
 MXFP8 tuples, source-weight preservation and skipped/empty/padded queries. This
 host test environment deliberately does not stand in for the deployment target
 (aarch64/Python 3.12) or its pinned Torch/CANN stack. Ruff and whitespace checks
 were run on changed files; full repository pre-commit/NPU CI was not run.
 
-The author reported successful branch validation on 2026-11-09. Exact run
+After integrating upstream main at `3725f6b`, CPU comparisons found identical
+results for 64 standard-provider routing cases and identical torch_npu argument
+values/storage and returned data in six direct legacy Prolog cases. Upstream
+MLAPO/PCP helpers and Indexer metadata/cache methods were also checked for AST
+equality. Query TP row sharding and FP8 LI cache forwarding are covered by the
+expanded contracts. These checks do not establish A3 NPU numerical or performance
+parity; supported-environment runtime tests and hardware validation remain needed.
+
+The author reported successful validation of runtime revision `6ade10b` on
+2026-11-09, before this upstream integration. Exact run
 commands/logs, graph-mode coverage, numerical results and performance numbers
 were not supplied with that confirmation. This report is separate from the
 local CPU tests above and does not establish every item in the following

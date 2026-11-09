@@ -208,7 +208,6 @@ def routing():
     family = SimpleNamespace(FP8_OPTIMIZED=object())
     profile = SimpleNamespace(device_adaptor_family=family.FP8_OPTIMIZED)
     ascend = SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(enabled=False))
-    cp = Mock(return_value=False)
     device_operator = _extract_class(DEVICE_PATH, "A5DeviceAdaptor", ["get_mla_prolog_backend"], {})
     kpool_cls = _extract_class(
         INDEXER_PATH, "Glm5NextKPoolIndexerBackend", ["supports_bf16_query_input"], _quant_globals()
@@ -236,7 +235,6 @@ def routing():
             DeviceOperator=device_operator,
             get_current_hardware_profile=lambda: profile,
             get_ascend_config=lambda: ascend,
-            enable_dsa_cp=cp,
             logger=Mock(),
         ),
     )
@@ -265,7 +263,7 @@ def routing():
     impl._process_weights_for_fused_prolog_v3 = Mock()
     impl._process_weights_for_fused_mlapo = Mock()
     impl._mla_prolog_backend = impl._select_mla_prolog_backend()
-    return SimpleNamespace(impl=impl, pp=pp, profile=profile, ascend=ascend, cp=cp, device_operator=device_operator)
+    return SimpleNamespace(impl=impl, pp=pp, profile=profile, ascend=ascend, device_operator=device_operator)
 
 
 @pytest.mark.parametrize("tokens", [1, 128, 8192])
@@ -325,7 +323,7 @@ def test_decode_only_policy_preserves_legacy_mlapo_limit(tokens):
 def test_forward_selects_runtime_policy_before_prolog_dispatch():
     tree = ast.parse(SFA_PATH.read_text(encoding="utf-8"))
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AscendSFAImpl")
-    forward = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "forward")
+    forward = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_forward_impl")
     choices = [
         node
         for node in ast.walk(forward)
@@ -551,7 +549,6 @@ def test_model_wrapper_and_piecewise_split_keep_mla_opaque():
         ("pcp", "parallel"),
         ("dcp", "parallel"),
         ("sp", "parallel"),
-        ("dsa_cp", "parallel"),
         ("offload", "offload"),
         ("turboquant", "TurboQuant"),
     ],
@@ -573,8 +570,6 @@ def test_unsupported_configuration_fails_without_prepare(routing, case, reason):
         config.parallel_config.decode_context_parallel_size = 2
     elif case == "sp":
         impl.enable_sp = True
-    elif case == "dsa_cp":
-        routing.cp.return_value = True
     elif case == "offload":
         routing.ascend.sparse_kv_offload_config.enabled = True
     else:
@@ -848,12 +843,18 @@ def test_prepare_hook_splits_loaded_weights_without_mutating_source():
 
 @pytest.mark.parametrize("compute_topk", [False, True])
 @pytest.mark.parametrize("bf16_indexer", [False, True])
-def test_indexer_forward_passes_sliced_query_to_projection(compute_topk, bf16_indexer):
+@pytest.mark.parametrize("row_shard", [None, (1, 3)])
+@pytest.mark.parametrize("fp8_cache", [False, True])
+@pytest.mark.parametrize("graph_mode", ["eager", "full"])
+def test_indexer_forward_preserves_query_shards_and_full_cache_inputs(
+    compute_topk, bf16_indexer, row_shard, fp8_cache, graph_mode
+):
     metadata_type = type("Metadata", (SimpleNamespace,), {})
     tail_type = type("TailMetadata", (SimpleNamespace,), {})
-    metadata = metadata_type(query_metadata=None, num_actual_tokens=3, pcp_hidden_restore_indices=None)
+    shard = None if row_shard is None else SimpleNamespace(start=row_shard[0], stop=row_shard[1])
+    metadata = metadata_type(indexer_row_shard=shard, num_actual_tokens=3, pcp_hidden_restore_indices=None)
     tail = tail_type()
-    context = SimpleNamespace(attn_metadata={"tail": tail}, cudagraph_runtime_mode="eager")
+    context = SimpleNamespace(attn_metadata={"tail": tail}, cudagraph_runtime_mode=graph_mode)
     cls = _extract_class(
         INDEXER_PATH,
         "Glm5NextKPoolIndexerBackend",
@@ -863,7 +864,6 @@ def test_indexer_forward_passes_sliced_query_to_projection(compute_topk, bf16_in
             AscendIndexerKPoolMetadata=metadata_type,
             AscendIndexerKPoolTailMetadata=tail_type,
             get_forward_context=lambda: context,
-            CUDAGraphMode=SimpleNamespace(FULL="full"),
             F=torch.nn.functional,
         ),
     )
@@ -876,37 +876,123 @@ def test_indexer_forward_passes_sliced_query_to_projection(compute_topk, bf16_in
     impl.q_lora_rank = Q_LORA_RANK
     impl.softmax_scale = 1.0
     impl._head_weight_f32 = torch.ones((NUM_HEADS, HIDDEN_SIZE))
-    impl.wq_b = Mock(return_value=(torch.ones((3, NUM_HEADS * impl.head_dim), dtype=torch.bfloat16),))
+    impl.wq_b = Mock(side_effect=lambda x: (torch.ones((x[0].shape[0], NUM_HEADS * impl.head_dim)),))
     impl.wq_b.quant_method = SimpleNamespace(quant_method=Mxfp8Method())
     impl.wq_b.mxfp8_tp_padding = (0, 0)
     if bf16_indexer:
         impl.wq_b.quant_method = UnquantizedMethod()
         impl.wq_b.weight = torch.ones((NUM_HEADS * impl.head_dim, Q_LORA_RANK), dtype=torch.bfloat16)
         impl.wq_b.side_effect = lambda x: (torch.nn.functional.linear(x, impl.wq_b.weight),)
-    impl._bound_cache = Mock(return_value=object())
+    key_cache, scale_cache, tail_cache = object(), object(), object()
+    caches = (key_cache, scale_cache) if fp8_cache else (key_cache,)
+    impl._bound_caches = Mock(side_effect=lambda layer: caches if layer is impl.k_cache else (tail_cache,))
     impl._forward_cann = Mock(return_value=object())
-    values, scales = _query_tuple()
-    hidden = torch.ones((5, HIDDEN_SIZE), dtype=torch.bfloat16)
-    query = torch.ones((5, Q_LORA_RANK), dtype=torch.bfloat16) if bf16_indexer else (values, scales)
-    if bf16_indexer and not compute_topk:
-        query = None  # Key/cache update must not inspect an unused Query.
+    # Upstream SFA owns trimming: FULL graphs retain padded rows; eager callers trim.
+    tokens = 5 if graph_mode == "full" else 3
+    hidden = (torch.arange(tokens).unsqueeze(1) + 1).expand(tokens, HIDDEN_SIZE).to(torch.bfloat16)
+    values = torch.arange(5).unsqueeze(1).expand(5, Q_LORA_RANK).to(torch.uint8).view(torch.float8_e4m3fn)
+    scales = (torch.arange(5).unsqueeze(1) + 127).expand(5, Q_LORA_RANK // 32).to(torch.uint8)
+    scales = scales.view(torch.float8_e8m0fnu)
+    native_query = (torch.arange(5).unsqueeze(1) + 1).expand(5, Q_LORA_RANK).to(torch.bfloat16)
+    query = native_query if bf16_indexer else (values, scales)
+    if not compute_topk:
+        query = None  # Cache-only execution must not inspect or project Query.
     result = impl.forward(hidden, query, hidden, metadata, compute_topk=compute_topk)
     assert result is impl._forward_cann.return_value
     call = impl._forward_cann.call_args
-    assert call.args[0].shape[0] == 3
+    torch.testing.assert_close(call.args[0], hidden, rtol=0, atol=0)
+    assert call.args[0].shape[0] == tokens  # Never shard or re-trim key/cache writes.
+    assert call.args[3] is key_cache and call.args[4] is tail_cache
+    assert call.kwargs["indexer_scale_cache"] is (scale_cache if fp8_cache else None)
+    assert call.kwargs["compute_topk"] is compute_topk
     if compute_topk:
+        start, stop = row_shard if row_shard is not None else (0, tokens)
         impl.wq_b.assert_called_once()
         passed_query = impl.wq_b.call_args.args[0]
         if bf16_indexer:
-            torch.testing.assert_close(passed_query, query[:3], rtol=0, atol=0)
-            assert passed_query.untyped_storage().data_ptr() == query.untyped_storage().data_ptr()
+            torch.testing.assert_close(passed_query, native_query[start:stop], rtol=0, atol=0)
+            assert passed_query.untyped_storage().data_ptr() == native_query.untyped_storage().data_ptr()
         else:
-            passed_values, passed_scales = passed_query
-            assert passed_values.shape == (3, Q_LORA_RANK)
-            assert passed_scales.shape == (3, Q_LORA_RANK // 32)
-            assert passed_values.untyped_storage().data_ptr() == values.untyped_storage().data_ptr()
-            assert passed_scales.untyped_storage().data_ptr() == scales.untyped_storage().data_ptr()
-        assert call.args[1].shape == (3, NUM_HEADS, impl.head_dim)
+            for part, original in zip(passed_query, (values, scales)):
+                assert torch.equal(part.view(torch.uint8), original[start:stop].view(torch.uint8))
+                assert part.untyped_storage().data_ptr() == original.untyped_storage().data_ptr()
+        assert call.args[1].shape == (stop - start, NUM_HEADS, impl.head_dim)
+        expected_weights = torch.nn.functional.linear(hidden[start:stop].float(), impl._head_weight_f32)
+        expected_weights = expected_weights.to(call.args[1].dtype) * (impl.softmax_scale * impl.n_head**-0.5)
+        torch.testing.assert_close(call.args[2], expected_weights, rtol=0, atol=0)
     else:
         impl.wq_b.assert_not_called()
         assert call.args[1] is None and call.args[2] is None
+
+
+@pytest.mark.parametrize("method_type", [None, DynamicMethod, StaticMethod, Mxfp8Method])
+@pytest.mark.parametrize("rope_dim", [0, 64])
+@pytest.mark.parametrize("enable_mlapo", [False, True])
+@pytest.mark.parametrize("cache_quant", [False, True])
+@pytest.mark.parametrize("kv_consumer", [False, True])
+def test_a2_a3_standard_provider_keeps_upstream_routing(
+    routing, monkeypatch, method_type, rope_dim, enable_mlapo, cache_quant, kv_consumer
+):
+    # A2/A3 use BaseDeviceAdaptor, not the A5-only packaged backend override.
+    base = _extract_class(DEVICE_PATH, "BaseDeviceAdaptor", ["get_mla_prolog_backend"], {})
+    monkeypatch.setattr(routing.device_operator, "get_mla_prolog_backend", base.get_mla_prolog_backend)
+    impl = routing.impl
+    routing.profile.device_adaptor_family = object()
+    method = UnquantizedMethod() if method_type is None else method_type()
+    impl.vllm_config.kv_transfer_config = SimpleNamespace(is_kv_consumer=True) if kv_consumer else None
+    impl.is_kv_consumer = kv_consumer
+    impl.qk_rope_head_dim = rope_dim
+    impl.fused_qkv_a_proj = _projection(method)
+    impl.q_proj = _projection(method)
+    if method_type is None:
+        # Unquantized linear methods are the outer method, not a quantizer wrapper.
+        impl.fused_qkv_a_proj.quant_method = UnquantizedMethod()
+        impl.q_proj.quant_method = UnquantizedMethod()
+        assert impl._get_layer_quant_method(impl.fused_qkv_a_proj) is None
+    impl._quant_type = method_type
+    impl.enable_mlapo = enable_mlapo
+    impl.enable_sparse_sfa_c8 = cache_quant
+    impl._mla_prolog_backend = impl._select_mla_prolog_backend()
+    assert impl._mla_prolog_backend == "torch_npu"
+    assert not impl._uses_cannbot_prolog()
+    assert not impl._uses_native_indexer_query()
+    expected = routing.pp.NATIVE
+    if rope_dim:
+        if method_type in (DynamicMethod, Mxfp8Method) or (method_type is None and kv_consumer and not cache_quant):
+            expected = routing.pp.PROLOG_V3
+        elif method_type is StaticMethod and enable_mlapo and not cache_quant:
+            expected = routing.pp.MLAPO
+    assert impl._resolve_preprocess_type(torch.bfloat16) is expected
+    if expected is routing.pp.PROLOG_V3:
+        impl._process_weights_for_fused_prolog_v3.assert_called_once()
+        impl._process_weights_for_fused_mlapo.assert_not_called()
+    elif expected is routing.pp.MLAPO:
+        impl._process_weights_for_fused_mlapo.assert_called_once_with(torch.bfloat16)
+        impl._process_weights_for_fused_prolog_v3.assert_not_called()
+    else:
+        impl._process_weights_for_fused_prolog_v3.assert_not_called()
+        impl._process_weights_for_fused_mlapo.assert_not_called()
+
+
+@pytest.mark.parametrize("tokens", [1, 1024, 1025, 8192])
+@pytest.mark.parametrize("state", ["DecodeOnly", "PrefillNoCache", "PrefillCacheHit", "ChunkedPrefill", "SpecDecoding"])
+@pytest.mark.parametrize("prefills", [0, 2])
+def test_torch_npu_prolog_has_no_cannbot_decode_only_restriction(tokens, state, prefills):
+    pp = SimpleNamespace(NATIVE=object(), PROLOG_V3=object(), MLAPO=object())
+    states = SimpleNamespace(DecodeOnly="DecodeOnly")
+    cls = _extract_class(
+        SFA_PATH,
+        "AscendSFAImpl",
+        ["_uses_cannbot_prolog", "_runtime_preprocess_type"],
+        dict(PreprocessType=pp, AscendAttentionState=states, MLAPO_MAX_SUPPORTED_TOKENS=1024),
+    )
+    impl = cls()
+    impl.preprocess_type = pp.PROLOG_V3
+    impl._mla_prolog_backend = "torch_npu"
+    impl.qk_rope_head_dim = 64
+    assert (
+        impl._runtime_preprocess_type(
+            SimpleNamespace(attn_state=getattr(states, state, state), num_prefills=prefills), tokens
+        )
+        is pp.PROLOG_V3
+    )
