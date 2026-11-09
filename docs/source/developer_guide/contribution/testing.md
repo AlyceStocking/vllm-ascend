@@ -199,10 +199,10 @@ You can run tests with `pytest` as well. Typical examples:
     VLLM_USE_MODELSCOPE=true pytest -sv tests/e2e/pull_request/one_card/
 
     # Run a certain test script
-    VLLM_USE_MODELSCOPE=true pytest -sv tests/e2e/pull_request/one_card/test_qwen3_0_6b.py
+    VLLM_USE_MODELSCOPE=true pytest -sv tests/e2e/pull_request/one_card/model_runner_v2/test_qwen3_0_6B_basic.py
 
     # Run a certain case in test script
-    VLLM_USE_MODELSCOPE=true pytest -sv tests/e2e/pull_request/one_card/test_qwen3_0_6b.py::test_dense_default_full_and_piecewise_graph
+    VLLM_USE_MODELSCOPE=true pytest -sv tests/e2e/pull_request/one_card/model_runner_v2/test_qwen3_0_6B_basic.py::test_qwen3_dense_graph_mode
     ```
 
 === "Multi-card"
@@ -257,7 +257,7 @@ For running nightly multi-node model test cases locally, refer to the `Running L
 
 #### E2E test examples
 
-- Offline test example: [`tests/e2e/pull_request/one_card/test_qwen3_0_6b.py`](https://github.com/vllm-project/vllm-ascend/blob/main/tests/e2e/pull_request/one_card/test_qwen3_0_6b.py)
+- Offline test example: [`tests/e2e/pull_request/one_card/model_runner_v2/test_qwen3_0_6B_basic.py`](https://github.com/vllm-project/vllm-ascend/blob/main/tests/e2e/pull_request/one_card/model_runner_v2/test_qwen3_0_6B_basic.py)
 
 ### Csrc incremental build cache checks
 
@@ -298,7 +298,7 @@ You can preview locally which runners a set of tests would be routed to:
 
 ```bash
 python3 .github/workflows/scripts/select_tests.py \
-  --explicit-e2e-tests tests/e2e/pull_request/one_card/test_qwen3_0_6b.py
+  --explicit-e2e-tests tests/e2e/pull_request/one_card/model_runner_v2/test_qwen3_0_6B_basic.py
 
 # Full suite routing (mirrors the ready-all mode)
 python3 .github/workflows/scripts/select_tests.py --all-tests
@@ -396,25 +396,29 @@ For block extraction, plan preview, and selection rules, see the usage notes and
 
 ### Run docs link check
 
-You can validate external links in the Sphinx docs locally with:
+The **Docs link check** workflow checks changed Markdown files in PRs. Scheduled
+and manual runs, or PRs changing checker-related files, scan all documentation.
+
+For local checks, use a Python 3.11+ virtual environment and run from the repository root:
 
 ```bash
-make -C docs linkcheck SPHINXOPTS="-W --keep-going"
+python -m pip install -r docs/requirements-linkcheck.txt
+
+# Check specific files, or the full documentation directory.
+python .github/workflows/scripts/check_md_links.py docs/source/user_guide/release_notes.md --timeout 300
+python .github/workflows/scripts/check_md_links.py docs/source
 ```
 
-To check links in a specific Markdown file, pass the file to `sphinx-build`.
-For example, to check only `docs/source/user_guide/release_notes.md`:
+Add `--extract-only` to list links without making requests. The checker validates
+rendered HTTP(S) links and images, skipping code examples and `docs/source/zh`.
+Relative links and remote anchors are not checked.
 
-```bash
-cd docs
-sphinx-build -b linkcheck -W --keep-going \
-  source _build/linkcheck source/user_guide/release_notes.md
-```
+The check log ends with all blocking errors and non-blocking warnings, including
+URLs, source files, and reasons. Blocking errors fail CI; unresolved HTTP 429
+responses are warnings and remain unverified.
 
-The detailed report will be written to:
-
-- `docs/_build/linkcheck/output.txt`
-- `docs/_build/linkcheck/output.json`
+Reports are saved as `output.json` and `summary.md` under `docs/_build/linkcheck/`
+and uploaded as CI artifacts. Use `--report-dir` to change the local output directory.
 
 ## PR testing requirements
 

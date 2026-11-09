@@ -21,6 +21,7 @@ def _load_packaged():
     name = "vllm_ascend.ops.packaged_mla_prolog"
     if name not in sys.modules:
         spec = importlib.util.spec_from_file_location(name, MODULE_PATH)
+        assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)

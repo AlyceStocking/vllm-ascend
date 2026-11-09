@@ -1,12 +1,13 @@
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
 import torch
 import torch_npu
+from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
-from vllm.distributed import get_pcp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import get_pcp_group, get_tensor_model_parallel_world_size, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
@@ -18,6 +19,7 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     MLAAttentionImpl,
 )
+from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.utils import select_common_block_size
 
@@ -59,6 +61,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 )
 from vllm_ascend.ops.mla_prolog import MX_GROUP_SIZE, PreparedMlaProlog, mla_prolog, prepare_mla_prolog
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
+from vllm_ascend.ops.triton.pcp_kv_cache import copy_pcp_kv_cache
 from vllm_ascend.quantization.methods import (
     AscendW8A8DynamicLinearMethod,
     AscendW8A8LinearMethod,
@@ -69,13 +72,15 @@ from vllm_ascend.utils import (
     ACL_FORMAT_FRACTAL_ND,
     ACL_FORMAT_FRACTAL_NZ,
     dispose_layer,
-    enable_dsa_cp,
+    enable_pcp_o_proj_weight_sharding,
+    enable_sfa_dcp_replicated_indexer,
     enable_sp,
     is_mtp_layer,
     is_rl_weight_update_enabled,
     maybe_trans_nz,
     vllm_version_is,
 )
+from vllm_ascend.weight_switch import ParallelOProjection, WeightSwitchConfig
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -269,7 +274,11 @@ class SparseMLAMetadataState:
         expand_factor = max(cache_block_size // kernel_block_size, 1)
         table_width = cdiv(vllm_config.model_config.max_model_len, cache_block_size) * expand_factor
         capture_sizes = vllm_config.compilation_config.cudagraph_capture_sizes or []
-        table_rows = max([vllm_config.scheduler_config.max_num_seqs + 1, *capture_sizes])
+        max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+            # PCP represents each prefill with two rank-local request chunks.
+            max_num_reqs *= 2
+        table_rows = max([max_num_reqs + 1, *capture_sizes])
         self.block_table_buffer = torch.empty(table_rows, table_width, dtype=torch.int32, device=device)
         if self.use_smla:
             config = vllm_config.model_config.hf_text_config
@@ -373,9 +382,17 @@ class AscendSFABackend(AttentionBackend):
             from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadMetadataBuilder
 
             return AscendSFAKVOffloadMetadataBuilder
-        from vllm_ascend.attention.context_parallel.sfa_cp import resolve_sfa_metadata_builder
+        vllm_config = get_current_vllm_config()
+        if enable_sfa_dcp_replicated_indexer(vllm_config):
+            from vllm_ascend.attention.context_parallel.sfa_cp import (
+                AscendSFADCPMetadataBuilder,
+                AscendSFAPCPDCPMetadataBuilder,
+            )
 
-        return resolve_sfa_metadata_builder(get_current_vllm_config())
+            if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+                return AscendSFAPCPDCPMetadataBuilder
+            return AscendSFADCPMetadataBuilder
+        return AscendSFAMetadataBuilder
 
     @staticmethod
     def get_kv_cache_shape(
@@ -393,9 +410,11 @@ class AscendSFABackend(AttentionBackend):
             from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadImpl
 
             return AscendSFAKVOffloadImpl
-        from vllm_ascend.attention.context_parallel.sfa_cp import resolve_sfa_impl
+        if enable_sfa_dcp_replicated_indexer(get_current_vllm_config()):
+            from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPImpl
 
-        return resolve_sfa_impl(get_current_vllm_config())
+            return AscendSFADCPImpl
+        return AscendSFAImpl
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int]:
@@ -493,17 +512,6 @@ def _int64_kv_slots(slots: torch.Tensor, attn_metadata: M) -> torch.Tensor:
     return cached[1]
 
 
-@dataclass
-class SFAForwardContext:
-    """Parallel-layout inputs consumed by the shared SFA forward template."""
-
-    actual_seq_lengths_query: torch.Tensor
-    actual_seq_lengths_key: torch.Tensor
-    kv_slot_mapping: torch.Tensor
-    topk_num_tokens: int
-    gather_full_o_proj: bool = False
-
-
 class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
     """
     NOTE: Please read the comment at the top of the file before trying to
@@ -549,28 +557,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             )
         self.reorder_batch_threshold = self.decode_threshold
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
-
-    def _prepare_parallel_metadata(
-        self,
-        common_attn_metadata: AscendCommonAttentionMetadata,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        cum_query_lens: torch.Tensor,
-        seq_lens: torch.Tensor,
-        draft_index: int | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
-        """Customize metadata tensors for a parallel SFA layout."""
-        return cos, sin, slot_mapping, {}
-
-    def _update_parallel_slot_mapping(
-        self,
-        metadata: AscendSFAMetadata,
-        slot_mapping: torch.Tensor,
-        num_input_tokens: int,
-    ) -> None:
-        """Update optional parallel metadata after an outer layout wrapper."""
-        return
 
     @staticmethod
     def determine_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
@@ -693,16 +679,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         else:
             cos, sin = get_cos_and_sin_mla(input_positions, use_cache=(draft_index is None))
 
-        cos, sin, slot_mapping, parallel_metadata = self._prepare_parallel_metadata(
-            common_attn_metadata,
-            cos,
-            sin,
-            slot_mapping,
-            cum_query_lens,
-            seq_lens,
-            draft_index,
-        )
-
         metadata = self.metadata_cls(  # type: ignore
             num_input_tokens=num_input_tokens,
             num_actual_tokens=num_actual_tokens,
@@ -726,7 +702,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             max_query_len=common_attn_metadata.max_query_len,
             max_seq_len=common_attn_metadata.max_seq_len,
             block_size=block_size,
-            **parallel_metadata,
         )
         (
             metadata.num_decodes,
@@ -795,6 +770,10 @@ class AscendSFAImpl(MLAAttentionImpl):
     # value. With DCP disabled it does not change the draft KV-cache layout.
     supports_mtp_with_cp_non_trivial_interleave_size: bool = True
 
+    supports_pcp: ClassVar[bool] = True
+    o_proj_full_pools: ClassVar[dict[Any, torch.Tensor]] = {}
+    o_proj_weight_switch_pool_key = "sfa_pcp_o_proj"
+
     def __init__(
         self,
         num_heads: int,
@@ -843,6 +822,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         ascend_config = get_ascend_config()
         self.vllm_config = get_current_vllm_config()
+        self.pcp_enabled = self.vllm_config.parallel_config.prefill_context_parallel_size > 1
         self.is_pcp_decode_sharded = is_pcp_decode_sharding_enabled(self.vllm_config)
         # SFA absorbs kv_b_proj (and, for KV consumers on PROLOG_V3, the fused
         # qkv/q projections) and disposes the source parameters. A disposed
@@ -923,6 +903,33 @@ class AscendSFAImpl(MLAAttentionImpl):
             reasons = self._cannbot_config_unsupported_reasons()
             if reasons:
                 raise ValueError("Cannbot MLA Prolog: " + "; ".join(reasons))
+        self._initialize_pcp_o_proj()
+
+    def _initialize_pcp_o_proj(self) -> None:
+        self._parallel_o_proj: ParallelOProjection | None = None
+        self.enable_pcp_o_proj_weight_sharding = False
+        if not self.pcp_enabled:
+            return
+        self.enable_pcp_o_proj_weight_sharding = enable_pcp_o_proj_weight_sharding()
+        self._parallel_o_proj = ParallelOProjection(
+            self.o_proj.input_size_per_partition,
+            self.o_proj,
+            config=WeightSwitchConfig.from_group(get_pcp_group(), shard_axis="input"),
+            tp_group=get_tp_group(),
+            pool=self.o_proj_full_pools,
+            pool_key=self.o_proj_weight_switch_pool_key,
+            project_full=self._project_o_proj_full,
+            decode_sharded=self.is_pcp_decode_sharded,
+        )
+        if self.enable_pcp_o_proj_weight_sharding:
+            try:
+                self._parallel_o_proj.prepare_weight_load(self.vllm_config)
+            except (RuntimeError, ValueError) as exc:
+                logger.warning_once(
+                    "SFA-PCP O-projection weight sharding is unavailable (%s); using unsharded O-projection weights.",
+                    exc,
+                )
+                self.enable_pcp_o_proj_weight_sharding = False
 
     @property
     def uses_packed_sfa_main_cache(self) -> bool:
@@ -1024,6 +1031,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.has_indexer:
             self.indexer.process_weights_after_loading()
 
+        if self._parallel_o_proj is not None:
+            self._parallel_o_proj.enable()
+
     def _select_mla_prolog_backend(self) -> str:
         # The packaged ABI supports NoPE MXFP8, not every A5 SFA model.
         # Preserve native NoPE preprocessing for BF16/INT8 and the existing
@@ -1035,6 +1045,28 @@ class AscendSFAImpl(MLAAttentionImpl):
 
     def _uses_cannbot_prolog(self) -> bool:
         return getattr(self, "_mla_prolog_backend", "torch_npu") == "cannbot" and self.qk_rope_head_dim == 0
+
+    def _uses_native_indexer_query(self) -> bool:
+        # The Indexer projection is not a Prolog weight. Keep its original
+        # BF16 input path instead of dequantizing Prolog's MXFP8 query norm.
+        return (
+            self._uses_cannbot_prolog()
+            and self.has_indexer
+            and type(getattr(self.indexer, "impl", None)) is Glm5NextKPoolIndexerBackend
+            and Glm5NextKPoolIndexerBackend.supports_bf16_query_input(getattr(self.indexer, "wq_b", None))
+        )
+
+    def _runtime_preprocess_type(self, attn_metadata: M, num_input_tokens: int) -> PreprocessType:
+        """Diagnostic policy: packaged Prolog only for metadata-classified decode."""
+        fused_type = self.preprocess_type
+        if fused_type == PreprocessType.PROLOG_V3 and self._uses_cannbot_prolog():
+            # Decide before any cache-writing kernel. Mixed batches stay native
+            # as a whole; never retry native after a partially executed Prolog.
+            if attn_metadata.attn_state != AscendAttentionState.DecodeOnly or attn_metadata.num_prefills > 0:
+                return PreprocessType.NATIVE
+        if fused_type == PreprocessType.MLAPO and num_input_tokens > MLAPO_MAX_SUPPORTED_TOKENS:
+            return PreprocessType.NATIVE
+        return fused_type
 
     def _cannbot_config_unsupported_reasons(self) -> list[str]:
         """Validate the selected packaged ABI without device reads or mutations."""
@@ -1049,12 +1081,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if config.speculative_config is not None:
             reasons.append("does not support speculative decoding yet")
         parallel = config.parallel_config
-        if (
-            parallel.prefill_context_parallel_size != 1
-            or parallel.decode_context_parallel_size != 1
-            or self.enable_sp
-            or enable_dsa_cp()
-        ):
+        if parallel.prefill_context_parallel_size != 1 or parallel.decode_context_parallel_size != 1 or self.enable_sp:
             reasons.append("does not support context/sequence parallelism")
         if get_ascend_config().sparse_kv_offload_config.enabled:
             reasons.append("does not support sparse KV offload")
@@ -1088,8 +1115,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             rmsnorm_epsilon_ckv=self.kv_a_layernorm.variance_epsilon,
         )
         logger.warning_once(
-            "Cannbot MLA Prolog selected for A5 NoPE MXFP8: the public package "
-            "dispatches eager and full-graph execution inside the opaque MLA boundary. "
+            "Cannbot MLA Prolog diagnostic policy: metadata-classified decode only; "
+            "non-decode/prefill batches use native preprocessing. "
             "Direct functionalization of Prolog is unsupported because KV cache updates must remain in place. "
             "NPU correctness and performance require validation for this wheel/model combination."
         )
@@ -1122,21 +1149,17 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # PROLOG_V3 takes precedence over MLAPO and is the default fused
         # preprocessing for quantized SFA layers in every deployment (plain
-        # serving, PD KV producers and KV consumers). ``enable_dsa_cp`` is the
-        # prefill/P-node route selector: it routes to AscendSFADSACPImpl,
-        # which unconditionally disables fused preprocessing, so the two are
-        # mutually exclusive by construction. The C8 switches only select the
+        # serving, PD KV producers and KV consumers). The C8 switches select the
         # KV cache layout and are orthogonal to this choice. Unquantized
         # layers keep the NATIVE chain outside KV consumers because the
         # unquantized weight preparation transposes fused_qkv_a_proj.weight
         # in place, which the NATIVE fallback still consumes.
-        if getattr(self, "dcp_group", None) is None:
-            prolog_v3_eligible = qt is not None or self.is_kv_consumer
-            if prolog_v3_eligible and (
-                qt is AscendW8A8DynamicLinearMethod or qt is AscendW8A8MXFP8DynamicLinearMethod or qt is None
-            ):
-                if not self._get_fused_type_unsupported_reasons(PreprocessType.PROLOG_V3):
-                    return PreprocessType.PROLOG_V3
+        prolog_v3_eligible = qt is not None or self.is_kv_consumer
+        if prolog_v3_eligible and (
+            qt is AscendW8A8DynamicLinearMethod or qt is AscendW8A8MXFP8DynamicLinearMethod or qt is None
+        ):
+            if not self._get_fused_type_unsupported_reasons(PreprocessType.PROLOG_V3):
+                return PreprocessType.PROLOG_V3
 
         eligible = qt is AscendW8A8LinearMethod and self.enable_mlapo
         if eligible and not self._get_fused_type_unsupported_reasons(PreprocessType.MLAPO):
@@ -1159,12 +1182,7 @@ class AscendSFAImpl(MLAAttentionImpl):
     def _get_fused_type_unsupported_reasons(self, pp_type: PreprocessType) -> list[str]:
         reasons = []
         cannbot = self._uses_cannbot_prolog() and pp_type is PreprocessType.PROLOG_V3
-        bf16_indexer = (
-            cannbot
-            and self.has_indexer
-            and type(getattr(self.indexer, "impl", None)) is Glm5NextKPoolIndexerBackend
-            and Glm5NextKPoolIndexerBackend.supports_bf16_query_input(getattr(self.indexer, "wq_b", None))
-        )
+        bf16_indexer = cannbot and self._uses_native_indexer_query()
         if self.qk_rope_head_dim == 0 and not cannbot:
             reasons.append("NoPE SFA currently uses native preprocessing; fused NoPE contracts are not enabled.")
         if cannbot:
@@ -1178,7 +1196,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     if method.group_size != MX_GROUP_SIZE or method.dynamic_mx_quant_scale_alg != 0:
                         reasons.append(f"Cannbot requires per-32 MXFP8 scale_alg=0 for {name}")
                 elif not (name == "indexer.wq_b" and bf16_indexer):
-                    reasons.append(f"Cannbot requires an MXFP8 {name} (or BF16 wq_b with the KPool input bridge)")
+                    reasons.append(
+                        f"Cannbot requires an MXFP8 {name} (or BF16 wq_b with native KPool query recomputation)"
+                    )
                 if getattr(projection, "bias", None) is not None:
                     reasons.append(f"Cannbot does not support {name} bias")
                 if any(getattr(projection, "mxfp8_tp_padding", (0, 0))):
@@ -1193,8 +1213,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         quant_method = self._get_layer_quant_method(self.fused_qkv_a_proj)
         qt = type(quant_method) if quant_method is not None else None
         if pp_type is PreprocessType.PROLOG_V3:
-            # Only the CANNBot/KPool bridge decodes MX query tuples for BF16
-            # projections. Keep other PROLOG_V3 indexer contracts unchanged,
+            # CANNBot/KPool recomputes the native query for BF16 projections.
+            # Keep other PROLOG_V3 indexer contracts unchanged,
             # including layers that later toggle skip_topk.
             if self.has_indexer and not bf16_indexer:
                 wq_b = getattr(self.indexer, "wq_b", None)
@@ -1382,12 +1402,35 @@ class AscendSFAImpl(MLAAttentionImpl):
     def exec_kv(
         self,
         kv_no_split: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
+        cos: torch.Tensor | None,
+        sin: torch.Tensor | None,
         kv_cache: tuple,
         slots: torch.Tensor,
         attn_metadata: M,
     ):
+        if self.pcp_enabled:
+            if needs_pcp_kv_gather(attn_metadata, self.is_pcp_decode_sharded):
+                num_replicated_tokens = get_pcp_num_replicated_tokens(
+                    attn_metadata.num_decode_tokens or 0, self.is_pcp_decode_sharded
+                )
+                if self.qk_rope_head_dim == 0:
+                    # NoPE keeps the builder's padded rank stride for KV gathers.
+                    pad_tokens = attn_metadata.num_input_tokens - kv_no_split.shape[0]
+                    if pad_tokens < 0:
+                        raise ValueError("SFA PCP KV exceeds the rank-local padded token count.")
+                    if pad_tokens:
+                        kv_no_split = nn.functional.pad(kv_no_split, (0, 0, 0, pad_tokens))
+                    (kv_no_split,), slots = _gather_prefill_cache_inputs((kv_no_split,), slots, num_replicated_tokens)
+                else:
+                    (kv_no_split, cos, sin), slots = _gather_prefill_cache_inputs(
+                        (kv_no_split, cos, sin), slots, num_replicated_tokens
+                    )
+                assert slots.numel() == kv_no_split.shape[0], (
+                    "SFA PCP cache write requires one slot per gathered token: "
+                    f"tokens={kv_no_split.shape[0]}, slots={slots.numel()}."
+                )
+            else:
+                slots = slots[: kv_no_split.shape[0]]
         if self.qk_rope_head_dim == 0 and not self.enable_sparse_sfa_c8:
             assert self.kv_a_layernorm is not None
             values = self.kv_a_layernorm(kv_no_split.reshape(-1, self.kv_lora_rank))
@@ -1522,6 +1565,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         qt = self._quant_type
         use_c8 = self.enable_sparse_sfa_c8
+        native_indexer_query = self._uses_native_indexer_query()
 
         common: dict[str, Any] = dict(
             weight_dq=self.weight_dq,
@@ -1532,7 +1576,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             rmsnorm_gamma_ckv=self.kv_a_layernorm.weight.data,
             rmsnorm_epsilon_cq=self.q_a_layernorm.variance_epsilon,
             rmsnorm_epsilon_ckv=self.kv_a_layernorm.variance_epsilon,
-            query_norm_flag=self.has_indexer,
+            query_norm_flag=self.has_indexer and not native_indexer_query,
             qc_qr_scale=1.0,
             kc_scale=1.0,
             cache_mode="PA_BSND",
@@ -1618,7 +1662,18 @@ class AscendSFAImpl(MLAAttentionImpl):
         ql_nope = ql_nope.view(num_tokens, num_h, self.kv_lora_rank)
         q_pe = q_pe.view(num_tokens, num_h, self.qk_rope_head_dim)
 
-        if self.has_indexer:
+        if native_indexer_query:
+            # Match the native BF16 Indexer input, not the already-quantized
+            # query norm. This does not rerun any cache-writing operation.
+            # MTP skip_topk can still need the Indexer key/cache path, but no Q.
+            has_local_query = attn_metadata is None or attn_metadata.num_actual_tokens > 0
+            if num_tokens and self.runtime_has_indexer and not self.skip_topk and has_local_query:
+                assert self.fused_qkv_a_proj is not None, "BF16 Indexer query recomputation requires fused_qkv_a_proj"
+                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+                q_c = self.q_a_layernorm(qkv_lora[..., : self.q_lora_rank])
+            else:
+                q_c = None
+        elif self.has_indexer:
             if q_c is None:
                 raise RuntimeError("npu_mla_prolog_v3 did not return query_norm for SFA indexer.")
             q_c = q_c.view(num_tokens, self.q_lora_rank)
@@ -1811,108 +1866,107 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_key,
             block_table=block_table,
         )
-        if self.qk_rope_head_dim == 0:
-            # As in floating NoPE, graph-capacity rows may be unwritten by the kernel.
-            assert isinstance(output, torch.Tensor)
-            valid = torch.arange(ql_nope.shape[0], device=ql_nope.device) < actual_seq_lengths_query[-1]
-            output = output.masked_fill(~valid[:, None, None], 0)
         return output
 
-    def _record_query_gather_context(
-        self,
-        ql_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        attn_metadata: M,
-    ) -> None:
-        return
-
-    def _get_indexer_attn_q_gather_handle(self, attn_metadata: M) -> torch.distributed.Work | None:
-        return None
-
-    def _parallel_query_gather_dim(self) -> int:
-        """Dimension restored by an outer DCP query gather."""
-        return 1
-
-    def _prepare_kv_for_parallel(
+    def _store_packed_kv_cache(
         self,
         k_pe: torch.Tensor | None,
         k_nope: torch.Tensor | None,
         knope_scale: torch.Tensor | None,
-        full_gather_o_proj_enabled: bool,
-    ) -> tuple[
-        torch.Tensor | None,
-        list[torch.distributed.Work],
-    ]:
-        """Prepare native KV tensors for an optional parallel layout."""
-        return None, []
-
-    def _store_parallel_kv(
-        self,
-        k_pe: torch.Tensor | None,
-        k_nope: torch.Tensor | None,
-        knope_scale: torch.Tensor | None,
-        fused_kv_no_split: torch.Tensor | None,
-        kv_ag_handles: list[torch.distributed.Work],
-        kv_cache: tuple[torch.Tensor, ...] | None,
+        kv_cache: tuple[torch.Tensor, ...],
         slot_mapping_sfa: torch.Tensor,
         attn_metadata: M,
-        full_gather_o_proj_enabled: bool,
-    ) -> tuple[
-        torch.Tensor | None,
-        torch.Tensor | None,
-    ]:
-        """Store KV produced by native preprocessing."""
-        if self.uses_packed_sfa_main_cache:
-            assert k_pe is not None
-            assert k_nope is not None
-            assert knope_scale is not None
-            packed_kv = torch.cat(
-                [
-                    k_nope.view(-1, k_nope.shape[-1]),
-                    # Flatten leading dimensions even when the RoPE feature dimension is zero.
-                    k_pe.flatten(0, -2),
-                    knope_scale.view(-1, knope_scale.shape[-1]),
-                ],
-                dim=-1,
+    ) -> None:
+        """Store the packed C8 or TurboQuant KV produced by native preprocessing."""
+        assert k_pe is not None
+        assert k_nope is not None
+        assert knope_scale is not None
+        if (
+            self.pcp_enabled
+            and slot_mapping_sfa.numel() != k_nope.shape[0]
+            and needs_pcp_kv_gather(attn_metadata, self.is_pcp_decode_sharded)
+        ):
+            replicated_tokens = get_pcp_num_replicated_tokens(
+                attn_metadata.num_decode_tokens, self.is_pcp_decode_sharded
             )
-            packed_head_dim = self.sfa_qsfa_packed_kv_head_dim
-            assert packed_kv.shape[-1] == packed_head_dim
-            assert kv_cache is not None
-            packed_kv = packed_kv.view(-1, packed_head_dim)
-            DeviceOperator.scatter_cache(
-                kv_cache[0].view(-1, packed_head_dim),
-                slot_mapping_sfa[: packed_kv.shape[0]].view(-1, 1),
-                packed_kv,
-            )
-
-        return k_pe, k_nope
-
-    def _get_parallel_forward_context(
-        self,
-        attn_metadata: M,
-        num_input_tokens: int,
-        hidden_states: torch.Tensor,
-    ) -> SFAForwardContext:
-        return SFAForwardContext(
-            actual_seq_lengths_query=attn_metadata.cum_query_lens,
-            actual_seq_lengths_key=attn_metadata.seq_lens,
-            kv_slot_mapping=self._get_sfa_kv_slot_mapping(attn_metadata),
-            topk_num_tokens=num_input_tokens or hidden_states.shape[0],
+            if replicated_tokens:
+                pcp_size = get_pcp_group().world_size
+                local_tokens = attn_metadata.num_input_tokens
+                rank_slots = slot_mapping_sfa[: pcp_size * local_tokens].view(pcp_size, local_tokens)
+                # Native preprocessing deduplicates decode KV before gathering
+                # prefill rows. Deferred packed writes must use the same order.
+                slot_mapping_sfa = torch.cat(
+                    (rank_slots[0, :replicated_tokens], rank_slots[:, replicated_tokens:].reshape(-1))
+                )
+        packed_kv = torch.cat(
+            [
+                k_nope.view(-1, k_nope.shape[-1]),
+                # Flatten leading dimensions even when the RoPE feature dimension is zero.
+                k_pe.flatten(0, -2),
+                knope_scale.view(-1, knope_scale.shape[-1]),
+            ],
+            dim=-1,
+        )
+        packed_head_dim = self.sfa_qsfa_packed_kv_head_dim
+        assert packed_kv.shape[-1] == packed_head_dim
+        packed_kv = packed_kv.view(-1, packed_head_dim)
+        DeviceOperator.scatter_cache(
+            kv_cache[0].view(-1, packed_head_dim),
+            slot_mapping_sfa[: packed_kv.shape[0]].view(-1, 1),
+            packed_kv,
         )
 
-    def _prepare_native_hidden_states(
-        self,
-        hidden_states: torch.Tensor,
-        attn_metadata: M,
-    ) -> torch.Tensor:
-        return hidden_states
+    def _sync_pcp_kv_cache(self, kv_cache: tuple[torch.Tensor, ...], attn_metadata: M) -> None:
+        local_slots = attn_metadata.pcp_prolog_local_slots
+        global_slots = attn_metadata.pcp_prolog_global_slots
+        assert local_slots is not None and global_slots is not None
+        if not global_slots.numel():
+            return
+        num_replicated_tokens = get_pcp_num_replicated_tokens(
+            attn_metadata.num_decode_tokens or 0, self.is_pcp_decode_sharded
+        )
+        # Same stream orders the fused cache write, pack, collective and scatter.
+        # C8 packs quantized K, BF16 RoPE and scales into the first cache.
+        # The remaining tensors belong to the indexer and synchronize separately.
+        main_cache = kv_cache[:1] if self.enable_sparse_sfa_c8 else kv_cache[:2]
+        packed = copy_pcp_kv_cache(main_cache, local_slots[num_replicated_tokens:])
+        group = get_pcp_group()
+        gathered = group.all_gather(packed, dim=0)
+        if self.enable_sparse_sfa_c8:
+            # Preserve packed K, RoPE and scale bytes, including FP8 storage.
+            # The paired scatter writes the same payload to the same cache.
+            packed_kv = gathered.unsqueeze(1)
+            cache_bytes = main_cache[0].view(torch.int8)
+            key, value = packed_kv, packed_kv
+            key_cache, value_cache = cache_bytes, cache_bytes
+        else:
+            k_nope, k_pe = gathered.split([kv_cache[0].shape[-1], kv_cache[1].shape[-1]], dim=-1)
+            key, value = k_nope.unsqueeze(1), k_pe.unsqueeze(1)
+            key_cache, value_cache = kv_cache[0], kv_cache[1]
+        DeviceOperator.reshape_and_cache(
+            key=key,
+            value=value,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            slot_mapping=global_slots,
+        )
+
+    def _on_query_ready(self, ql_nope: torch.Tensor, q_pe: torch.Tensor | None, attn_metadata: M) -> None:
+        """Allow parallel implementations to start communication before packed KV writes."""
+
+    def _on_kv_cache_written(self, kv_cache: tuple[torch.Tensor, ...], attn_metadata: M) -> None:
+        """Allow parallel implementations to overlap communication with the indexer."""
 
     def _finalize_o_proj(
         self,
         attn_output: torch.Tensor,
         output: torch.Tensor,
-        gather_full_o_proj: bool,
     ) -> torch.Tensor:
+        if self._parallel_o_proj is not None:
+            return self._parallel_o_proj.forward(attn_output, output)
+        return self._project_o_proj_full(attn_output, output)
+
+    def _project_o_proj_full(self, attn_output: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
         output[...] = self.o_proj(attn_output)[0]
         return output
 
@@ -1920,6 +1974,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         self,
         attn_metadata: M,
     ) -> torch.Tensor:
+        if self.pcp_enabled:
+            assert attn_metadata.pcp_slot_mapping is not None
+            return attn_metadata.pcp_slot_mapping
         return attn_metadata.slot_mapping
 
     def _compose_sfa_kv_cache(self, kv_cache) -> tuple[torch.Tensor, ...] | None:
@@ -2024,7 +2081,32 @@ class AscendSFAImpl(MLAAttentionImpl):
     def forward(
         self,
         layer_name,
-        hidden_states: torch.Tensor,  # query in unified attn
+        hidden_states: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: M,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert output is not None, "Output tensor must be provided."
+        if self._parallel_o_proj is None:
+            return self._forward_impl(layer_name, hidden_states, kv_cache, attn_metadata, output)
+        # A short prefill shard can look like decode locally. Preserve the
+        # global prefill decision so every PCP rank selects the same mode.
+        has_prefill = attn_metadata is not None and (
+            attn_metadata.pcp_has_global_prefill
+            or attn_metadata.attn_state
+            not in {
+                AscendAttentionState.DecodeOnly,
+                AscendAttentionState.SpecDecoding,
+            }
+        )
+        needs_global_metadata = attn_metadata is not None and (has_prefill or self.is_pcp_decode_sharded)
+        with self._parallel_o_proj.batch(needs_global_metadata=needs_global_metadata, has_prefill=has_prefill):
+            return self._forward_impl(layer_name, hidden_states, kv_cache, attn_metadata, output)
+
+    def _forward_impl(
+        self,
+        layer_name,
+        hidden_states: torch.Tensor,
         kv_cache: tuple[torch.Tensor, ...],
         attn_metadata: M,
         output: torch.Tensor | None = None,
@@ -2041,7 +2123,14 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.qk_rope_head_dim == 0:
             num_tokens = min(hidden_states.shape[0], attn_metadata.slot_mapping.shape[0])
             if get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL:
-                num_tokens = min(num_tokens, attn_metadata.num_actual_tokens)
+                if self.vllm_config.parallel_config.prefill_context_parallel_size > 1 and needs_pcp_kv_gather(
+                    attn_metadata, self.is_pcp_decode_sharded
+                ):
+                    # Empty and uneven PCP ranks must keep the same padded
+                    # rows for KV gathers and O-projection collectives.
+                    num_tokens = min(num_tokens, attn_metadata.num_input_tokens)
+                else:
+                    num_tokens = min(num_tokens, attn_metadata.num_actual_tokens)
             if num_tokens == 0:
                 return output.zero_()
             hidden_states = hidden_states[:num_tokens]
@@ -2058,19 +2147,13 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # Inputs and outputs may be padded for CUDA graphs
         num_input_tokens = hidden_states.shape[0] if self.qk_rope_head_dim == 0 else attn_metadata.num_input_tokens
-        parallel_context = self._get_parallel_forward_context(
-            attn_metadata,
-            num_input_tokens,
-            hidden_states,
-        )
-        actual_seq_lengths_query = parallel_context.actual_seq_lengths_query
-        actual_seq_lengths_key = parallel_context.actual_seq_lengths_key
+        actual_seq_lengths_query = attn_metadata.cum_query_lens
+        actual_seq_lengths_key = attn_metadata.seq_lens
+        topk_num_tokens = num_input_tokens or hidden_states.shape[0]
+        if self._parallel_o_proj is not None:
+            self._parallel_o_proj.all_gather_weights()
 
-        fused_type: PreprocessType = self.preprocess_type
-        # PROLOG_V3 serves every attention state (decode, spec decoding and
-        # prefill); only MLAPO carries a per-call token-count limit.
-        if self.preprocess_type == PreprocessType.MLAPO and num_input_tokens > MLAPO_MAX_SUPPORTED_TOKENS:
-            fused_type = PreprocessType.NATIVE
+        fused_type = self._runtime_preprocess_type(attn_metadata, num_input_tokens)
 
         # IMPORTANT!
         # NOTE: With PIECEWISE ACL graphs, this method is executed in
@@ -2084,11 +2167,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         if gate_hidden_states is not None:
             gate_hidden_states = gate_hidden_states[:num_input_tokens]
 
-        if fused_type == PreprocessType.NATIVE:
-            # Trim in the input layout before CP adds padding and shards it.
-            hidden_states = self._prepare_native_hidden_states(hidden_states, attn_metadata)
-            if gate_hidden_states is not None:
-                gate_hidden_states = hidden_states
+        if fused_type == PreprocessType.NATIVE and gate_hidden_states is not None:
+            gate_hidden_states = hidden_states
 
         if fused_type != PreprocessType.NATIVE:
             # Keep the raw hidden states for the indexer's k path: the fused
@@ -2101,7 +2181,17 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # update the paged SFA and LI caches.
                 self.layerwise_kv_cache_hook.wait_for_layer(layer_name)
 
+            gather_pcp_kv = self.pcp_enabled and needs_pcp_kv_gather(attn_metadata, self.is_pcp_decode_sharded)
+            fused_slots = slot_mapping_sfa
+            if gather_pcp_kv:
+                fused_slots = attn_metadata.pcp_prolog_local_slots
+                assert fused_slots is not None and attn_metadata.pcp_prolog_global_slots is not None, (
+                    "PCP fused preprocessing requires slots prepared by the metadata builder."
+                )
             if fused_type == PreprocessType.PROLOG_V3:
+                if self.pcp_enabled and not gather_pcp_kv:
+                    # Reuse the builder's local view to cache the int64 conversion across layers.
+                    fused_slots = attn_metadata.slot_mapping
                 hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_prolog_v3(
                     hidden_states=hidden_states,
                     kv_cache=kv_cache,
@@ -2110,7 +2200,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     # npu_mla_prolog_v3 requires int64 cache indices; reuse
                     # the per-step conversion so all layers of a step share
                     # one Cast kernel (the .to() inside is a no-op on int64).
-                    slot_mapping=_int64_kv_slots(slot_mapping_sfa, attn_metadata),
+                    slot_mapping=_int64_kv_slots(fused_slots, attn_metadata),
                     attn_metadata=attn_metadata,
                 )
             else:
@@ -2119,10 +2209,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                     kv_cache=kv_cache,
                     cos=cos,
                     sin=sin,
-                    slot_mapping=slot_mapping_sfa,
+                    slot_mapping=fused_slots,
                     num_input_tokens=num_input_tokens,
                     attn_metadata=attn_metadata,
                 )
+            if gather_pcp_kv:
+                self._sync_pcp_kv_cache(kv_cache, attn_metadata)
         # native
         else:
             assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
@@ -2149,44 +2241,19 @@ class AscendSFAImpl(MLAAttentionImpl):
                 cos,
                 sin,
                 kv_cache,
-                parallel_context.kv_slot_mapping,
+                slot_mapping_sfa,
                 attn_metadata,
             )
             k_pe, k_nope = kv_outputs[:2]
             knope_scale = kv_outputs[2] if len(kv_outputs) == 3 else None
-            # k_li no longer exists at this point: it is computed by
-            # indexer.forward_k below and gathered at cache-write time, so
-            # the fused gather below only carries the main KV.
-            fused_kv_no_split, kv_ag_handles = self._prepare_kv_for_parallel(
-                k_pe,
-                k_nope,
-                knope_scale,
-                parallel_context.gather_full_o_proj,
-            )
-
             ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
             if self.qk_rope_head_dim:
                 q_pe = self.rope_single(q_pe, cos, sin)
-            self._record_query_gather_context(
-                ql_nope,
-                q_pe,
-                attn_metadata,
-            )
+            self._on_query_ready(ql_nope, q_pe, attn_metadata)
 
-            (
-                k_pe,
-                k_nope,
-            ) = self._store_parallel_kv(
-                k_pe,
-                k_nope,
-                knope_scale,
-                fused_kv_no_split,
-                kv_ag_handles,
-                kv_cache,
-                self._get_sfa_kv_slot_mapping(attn_metadata),
-                attn_metadata,
-                parallel_context.gather_full_o_proj,
-            )
+            if self.uses_packed_sfa_main_cache:
+                self._store_packed_kv_cache(k_pe, k_nope, knope_scale, kv_cache, slot_mapping_sfa, attn_metadata)
+            self._on_kv_cache_written(kv_cache, attn_metadata)
 
         # A sharded-decode PCP rank can own no request but must still write
         # and gather KV with the other ranks.
@@ -2208,16 +2275,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                 k_hidden_states,
                 indexer_attn_metadata,
                 compute_topk=not self.skip_topk and has_local_query,
-                attn_q_gather_handle=self._get_indexer_attn_q_gather_handle(attn_metadata),
             )
             if self.skip_topk:
-                topk_indices = self._get_indexcache_topk_indices(parallel_context.topk_num_tokens)
+                topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)
             elif self.use_index_cache and has_local_query:
                 self._update_indexcache_topk_indices(topk_indices)
         elif self.skip_topk:
             # Static shared-index layers keep no runtime indexer cache and
             # only reuse the shared top-k indices.
-            topk_indices = self._get_indexcache_topk_indices(parallel_context.topk_num_tokens)
+            topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)
         else:
             raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
 
@@ -2253,7 +2319,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         self._finalize_o_proj(
             attn_output,
             output[:num_input_tokens],
-            parallel_context.gather_full_o_proj,
         )
 
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))

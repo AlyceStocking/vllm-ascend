@@ -4,7 +4,40 @@ GLM5.3-Flash NoPE MLA Prolog follows the A5 DeepSeek V4.1 packaging pattern:
 device-adaptor selection, a Torch schema, fake outputs, PrivateUse1 dispatch and
 a cached lazy external import. The scope differs: GLM fuses preprocessing and
 writes KV cache; DeepSeek's packaged indexer/attention consumes prepared caches.
-This is framework integration, **not a validated NPU deployment or speedup claim**.
+This is framework integration, **not a quantified speedup claim**. Validation
+reports and evidence limitations are recorded below.
+
+## Diagnostic branch: native prefill, CANNBot decode
+
+`glm-cannbot-decode-only` is based on `5af1f31`. No new environment variable or
+serve argument is needed: retain the existing launch command, including
+`FULL_DECODE_ONLY`. For selected CANNBot NoPE layers, only metadata classified
+as `DecodeOnly` with `num_prefills == 0` uses Prolog. Prefill, cache-hit prefill,
+chunked/mixed and other non-decode states use the existing native chain for the
+whole batch. Other backends and the legacy MLAPO token limit are unchanged.
+
+This is a pre-execution route choice, not an exception fallback. Original
+projection/norm parameters and prepared CANNBot weights remain loaded, and both
+routes use the same KV cache. Native prefill avoids the CANNBot entry entirely.
+Decode with a BF16 Indexer recomputes its query using the original A projection
+and RMSNorm; no Prolog-output MXFP8-to-BF16 converter remains. Weight memory is
+not restored to the all-native baseline. The public Prolog package is still
+required for decode.
+
+**Classification caveat:** MRV2 may classify prefix-cache-hit prefill with only
+one uncached token per request as `DecodeOnly`; if `num_prefills` is also zero,
+it retains Prolog, including inside graph replay. This branch follows attention
+metadata, not a new scheduler-level prefill flag. It does not change the runner
+or add device-to-host reads.
+
+Compare against `da15e74` to isolate BF16 Indexer recomputation from the prior
+input-conversion implementation; both use the decode-only policy. Keep workload,
+warmup, prefix-cache hit rate and graph settings identical. Check startup for
+`Cannbot MLA Prolog diagnostic policy`.
+The policy and CPU contracts do not establish NPU correctness or performance:
+validate native-prefill to Prolog-decode transitions, BF16/C8 cache consistency,
+mixed batches and padded graph decode on the target system before relying on
+the TTFT result.
 
 ## Artifact installation: pending
 
@@ -36,7 +69,7 @@ fake tracing do not load the vendor compiler.
 | Property | Boundary |
 | --- | --- |
 | Hardware/artifact | A5 FP8-optimized profile; Linux aarch64, CPython 3.12 |
-| Execution integration | Eager prefill and full-graph decode; NPU validation pending |
+| Execution integration | Native prefill and Prolog decode; detailed hardware evidence not attached |
 | Activations | BF16 before existing dynamic MXFP8 input quantization |
 | Prolog projections | MXFP8, group size 32, scale algorithm 0; no bias or TP input padding |
 | KPool Indexer query projection | MXFP8 as above, or the unquantized Ascend linear method with BF16 weights; no bias or TP input padding |
@@ -44,7 +77,7 @@ fake tracing do not load the vendor compiler.
 | Normalization | Equal Q/KV epsilon; independent FP32 gamma snapshots |
 | Main cache | Contiguous PA_BSND BF16, or FP8 E4M3 C8 with 128-element groups and 528-byte slots |
 | Page size | 16..1024, aligned to 16, subject to attention backend constraints |
-| Query / query norm | BF16 query; E4M3 normalized query plus per-token/per-32 E8M0 scales |
+| Query / query norm | BF16 query; MXFP8 Indexer uses E4M3/E8M0 norm tuple; BF16 Indexer uses a natively recomputed BF16 norm |
 
 RL weight reloads, PD/KV transfer, speculative decoding, context/sequence
 parallelism, sparse KV offload, INT8 C8 and TurboQuant remain outside this
@@ -54,7 +87,7 @@ or HiF8 path is introduced. Shape admission does not prove AOT kernel coverage.
 
 ## Dispatcher and cache contract
 
-[packaged_mla_prolog.py](../../../vllm_ascend/ops/packaged_mla_prolog.py) defines
+[packaged_mla_prolog.py](https://github.com/vllm-project/vllm-ascend/blob/93e3048c969a9f216a4899adcffce2eb58b2db6f/vllm_ascend/ops/packaged_mla_prolog.py) defines
 `vllm_ascend::quant_mla_prolog`. Prepared weights/scales/gammas are explicit tensor
 arguments; no Python callable or layer state is captured in the schema. Its four
 outputs follow the vendor convention. MX scales cross the dispatcher as zero-copy
@@ -69,22 +102,30 @@ or non-ND cache is rejected, never copied. Functionalization that would clone
 and copy back persistent cache is explicitly rejected. Failures after launch
 propagate; there is no native retry on potentially modified cache.
 
-The [central adapter](../../../vllm_ascend/ops/mla_prolog.py) retains preparation
+The [central adapter](https://github.com/vllm-project/vllm-ascend/blob/93e3048c969a9f216a4899adcffce2eb58b2db6f/vllm_ascend/ops/mla_prolog.py) retains preparation
 and the canonical five outputs:
 `(query, query_rope, query_scale, query_norm, query_norm_scale)`.
 Cannbot `qr` is normalized low-rank Query, not RoPE Query; the adapter supplies
-empty BF16 `[T,N,0]` RoPE output. The [KPool Indexer](../../../vllm_ascend/attention/indexer_kpool.py)
+empty BF16 `[T,N,0]` RoPE output. The [KPool Indexer](https://github.com/vllm-project/vllm-ascend/blob/93e3048c969a9f216a4899adcffce2eb58b2db6f/vllm_ascend/attention/indexer_kpool.py)
 passes E4M3/E8M0 tuples directly to MXFP8 query projections. For an unquantized
-BF16 query projection, it decodes each value with its per-32 scale and rounds
-the product to BF16 (nearest-even) before calling the original projection.
-The bridge uses device-side integer byte operations, avoiding float8 casts,
-host readback and underflow of the minimum E8M0 scale. It does not modify
-weights, rerun RMSNorm or retry native Prolog. Only the KPool backend receives
-this eligibility exception; other PROLOG_V3 Indexers keep their existing guard.
+BF16 query projection, SFA disables Prolog query-norm output and recomputes
+`q_a_layernorm(fused_qkv_a_proj(hidden_states)[0][..., :q_lora_rank])`, following
+the native input path used by PR #20332. This keeps the original MXFP8 A
+projection and BF16 normalization semantics; it does not dequantize a Prolog
+output, change weights, or rerun any cache-writing operation. The earlier
+integer input converter is removed. Only CANNBot with a BF16 KPool Indexer
+receives this exception; other PROLOG_V3 contracts remain unchanged.
 
-This reconstructs the **quantized** query norm, not its pre-quantization BF16
-value. Validate Indexer top-k and model accuracy as well as bridge latency and
-NPU graph replay. In MLA layers with Q LoRA, SFA `q_proj` refers to the model
+Recomputation occurs only inside the selected decode Prolog path and when
+Indexer query work is needed. Physical-empty batches, disabled runtime Indexers,
+`skip_topk`, and zero-local-query batches skip it without disabling existing
+Indexer key/cache writes. FULL-graph padding is preserved, not trimmed to the
+actual-token count. Prefill/mixed batches already compute the native norm and
+never execute this extra path.
+
+The extra A projection and RMSNorm have real compute/memory costs; the source
+parameters remain resident. Validate top-k, logits, graph replay and end-to-end
+latency rather than assuming a speedup. In MLA layers with Q LoRA, SFA `q_proj` refers to the model
 `q_b_proj`; it is separate from `indexer.wq_b`, which is not a Prolog input.
 
 Loaded weights/scales are
@@ -100,7 +141,7 @@ private/native vendor call. The public API is used in eager and capture executio
 Ordinary compiled execution outside capture may still take the checked branch;
 no host-sync-free claim is made.
 
-The existing [MLA boundary](../../../vllm_ascend/ops/mla.py) already calls
+The existing [MLA boundary](https://github.com/vllm-project/vllm-ascend/blob/93e3048c969a9f216a4899adcffce2eb58b2db6f/vllm_ascend/ops/mla.py) already calls
 `torch.ops.vllm.mla_forward`; its fake implementation does not enter SFA, and
 its runtime implementation resolves persistent cache from the forward context
 before calling SFA. The packaged Prolog executes inside that opaque boundary.
@@ -138,14 +179,27 @@ vendor execution, aarch64/cp312 validation or NPU numerical evidence. Run normal
 repository UT/CI in the supported environment before merge as well.
 
 Local validation on Windows x86_64 / Python 3.14.7 / Torch 2.14.0+cpu:
-78 operator/dispatcher tests and 94 SFA/KPool/opaque-boundary tests passed,
-including all 65,536 E4M3/E8M0 byte pairs and changing-input CPU AOT execution
-of the BF16 Indexer bridge. This
+78 operator/dispatcher tests and 286 SFA/KPool/opaque-boundary tests passed,
+including native-prefill/mixed routing, BF16 query recomputation, unchanged
+MXFP8 tuples, source-weight preservation and skipped/empty/padded queries. This
 host test environment deliberately does not stand in for the deployment target
 (aarch64/Python 3.12) or its pinned Torch/CANN stack. Ruff and whitespace checks
 were run on changed files; full repository pre-commit/NPU CI was not run.
 
-Deferred internal A5 checks:
+After integrating upstream main at `3725f6b`, CPU comparisons found identical
+results for 64 standard-provider routing cases and identical torch_npu argument
+values/storage and returned data in six direct legacy Prolog cases. Upstream
+MLAPO/PCP helpers and Indexer metadata/cache methods were also checked for AST
+equality. Query TP row sharding and FP8 LI cache forwarding are covered by the
+expanded contracts. These checks do not establish A3 NPU numerical or performance
+parity; supported-environment runtime tests and hardware validation remain needed.
+
+The author reported successful validation of runtime revision `6ade10b` on
+2026-11-09, before this upstream integration. Exact run
+commands/logs, graph-mode coverage, numerical results and performance numbers
+were not supplied with that confirmation. This report is separate from the
+local CPU tests above and does not establish every item in the following
+hardware-review checklist:
 
 1. Record exact aarch64/cp312 wheel hashes and runtime revisions; verify public
    capture dispatch and AOT/JIT warmup coverage.
@@ -160,16 +214,18 @@ Deferred internal A5 checks:
    versus native BF16 rounding differs; matching cache layout does not establish
    numerical equivalence or speedup.
 
-## Release-note draft
+## Release note
 
-No PR number is assigned. Before opening a PR, place these entries in a numbered
-fragment following the repository release-note policy:
+[PR #21302](https://github.com/vllm-project/vllm-ascend/pull/21302) carries the
+[numbered release-note fragment](https://github.com/vllm-project/vllm-ascend/blob/93e3048c969a9f216a4899adcffce2eb58b2db6f/release_notes/fragments/21302.yaml).
+Scope of this integration:
 
 - Config: A5 NoPE MXFP8 MLA Prolog selects packaged CANNBot operators through the
   device adaptor rather than an environment opt-in.
 - Feature: Added lazy dispatcher/fake contracts with explicit KV-cache mutation
   and eager/full-graph routing. Matching Linux aarch64/Python 3.12 artifacts and
   hardware qualification remain required before deployment.
-- Fix: Allow MXFP8 CANNBot Prolog with a BF16 KPool Indexer by decoding its
-  normalized Query input on device, without changing Indexer weights or falling
-  back to native Prolog. NPU numerical and performance validation remains pending.
+- Fix: Replace the BF16 KPool input converter with native A-projection and
+  RMSNorm recomputation during CANNBot decode, without changing Indexer weights
+  or retrying cache writes. Prefill/mixed batches remain native. Detailed
+  numerical and performance evidence is not attached to the author report.
