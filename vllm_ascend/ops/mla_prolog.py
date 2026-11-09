@@ -351,5 +351,6 @@ def mla_prolog(
             torch_npu_prolog = torch_npu.npu_mla_prolog_v3
         return torch_npu_prolog(**kwargs)
     _require(backend == "cannbot", f"Unsupported MLA Prolog backend: {backend}")
-    _require(isinstance(prepared, PreparedMlaProlog), "Cannbot requires prepare_mla_prolog first")
+    if not isinstance(prepared, PreparedMlaProlog):
+        raise ValueError("Cannbot requires prepare_mla_prolog first")
     return _cannbot_forward(prepared=prepared, **kwargs)

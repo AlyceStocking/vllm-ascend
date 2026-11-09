@@ -12,7 +12,7 @@ import importlib.util
 import math
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -483,6 +483,17 @@ def test_invalid_forward_shape_does_not_launch(adapter, prepared, weights, name,
     with pytest.raises((ValueError, TypeError)):
         _forward(adapter, prepared, inputs)
     assert not vendor.calls
+
+
+@pytest.mark.parametrize("invalid_prepared", [None, object(), SimpleNamespace(wqa=object())])
+def test_cannbot_requires_prepared_state_before_dispatch(adapter, monkeypatch, invalid_prepared):
+    packaged_forward = Mock()
+    native_forward = Mock()
+    monkeypatch.setattr(adapter, "_cannbot_forward", packaged_forward)
+    with pytest.raises(ValueError, match="^Cannbot requires prepare_mla_prolog first$"):
+        adapter.mla_prolog(backend="cannbot", prepared=invalid_prepared, torch_npu_prolog=native_forward)
+    packaged_forward.assert_not_called()
+    native_forward.assert_not_called()
 
 
 def test_unknown_backend_is_not_silently_fallback(adapter):

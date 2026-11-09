@@ -1668,6 +1668,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             # MTP skip_topk can still need the Indexer key/cache path, but no Q.
             has_local_query = attn_metadata is None or attn_metadata.num_actual_tokens > 0
             if num_tokens and self.runtime_has_indexer and not self.skip_topk and has_local_query:
+                assert self.fused_qkv_a_proj is not None, "BF16 Indexer query recomputation requires fused_qkv_a_proj"
                 qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
                 q_c = self.q_a_layernorm(qkv_lora[..., : self.q_lora_rank])
             else:
